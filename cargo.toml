@@ -1,0 +1,44 @@
+## Cargo.toml
+[package]
+name = "MiraiTrace"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+debug = 2      # full debuginfo, best for stepping
+opt-level = 0
+
+
+[profile.release]
+opt-level = 3          # maximize speed
+lto = "thin"           # faster link, great runtime perf
+codegen-units = 1      # better inlining across crates
+panic = "abort"        # smaller, faster binary
+strip = "symbols"      # optional: smaller exe
+
+
+
+[dependencies]
+# UI + GPU
+eframe = { version = "0.27", features = ["wgpu"] }
+egui = "0.27"
+egui_plot = "0.27"
+# Utilities
+parking_lot = "0.12"
+rand = "0.8"
+rand_pcg = "0.3"
+rayon = "1.10"
+# Image I/O
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Native file dialogs
+rfd = "0.14"
+# Byte casting helpers (optional, handy when you SIMD later)
+bytemuck = { version = "1.15", features = ["min_const_generics"] }
+
+
+
+
+
+
+
+

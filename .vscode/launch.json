@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug (CodeLLDB)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/MiraiTrace.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build",
+      "env": {
+        "RUST_BACKTRACE": "full"
+      },
+      "console": "integratedTerminal",
+      "stopOnEntry": false
+    }
+  ]
+}
