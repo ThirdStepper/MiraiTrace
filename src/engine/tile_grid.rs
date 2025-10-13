@@ -90,9 +90,9 @@ impl TileGrid {
             let cx1 = (region.x + src_w).min(canvas_w);
             if cx0 >= cx1 { continue; }                // empty after clipping
 
-            // Map to source x range
-            let sx0 = cx0 - region.x;                  // 0 .. src_w-1
-            //let sx1 = cx1 - region.x;
+            // Map to source x range (source is 0-indexed within the region buffer)
+            // When x is at cx0, we want source offset 0
+            // When x is at cx1-1, we want source offset (cx1-cx0-1)
 
             // Walk spans that don't cross tile boundaries on the canvas
             // (tile membership is based on canvas coords)
@@ -107,9 +107,9 @@ impl TileGrid {
                 let span_end_x = ((tx + 1) * tile_size).min(cx1);
 
                 // Byte offsets
-                let mut c = canvas_row + x * 4;                        // canvas byte index
-                let mut i = src_row + (x - cx0 + sx0) * 4;             // source byte index
-                let end_i = src_row + (span_end_x - cx0 + sx0) * 4;    // exclusive
+                let mut c = canvas_row + x * 4;                   // canvas byte index
+                let mut i = src_row + (x - cx0) * 4;              // FIXED: source is 0-indexed in region buffer
+                let end_i = src_row + (span_end_x - cx0) * 4;     // FIXED: exclusive end
 
                 // Accumulate SSE delta across the span, apply once
                 let mut span_delta: i64 = 0;
