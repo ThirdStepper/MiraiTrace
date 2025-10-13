@@ -51,6 +51,7 @@ pub struct MiraiTrace {
     // HUD options
     hud_density: HudDensity,
     show_mini_plot: bool,
+    show_stats_window: bool,  // Toggle for floating stats window
 
     // Canvas clear color (UI model). Changing it clears/rebaselines the engine.
     canvas_clear_color: egui::Color32,
@@ -85,7 +86,8 @@ impl MiraiTrace {
             show_canvas_only: false,
             hud_density: HudDensity::Auto,
             show_mini_plot: true,
-            canvas_clear_color: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255), // default black
+            show_stats_window: true,  // Show stats by default
+            canvas_clear_color: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255), // default white
         }
     }
 
@@ -270,25 +272,8 @@ impl MiraiTrace {
 
             ui.separator();
 
-            // ------------- HUD density (Auto / Compact / Full) -------------
-            let mut density = self.hud_density;
-            egui::ComboBox::from_label("HUD")
-                .selected_text(match density {
-                    HudDensity::Auto => "Auto",
-                    HudDensity::Compact => "Compact",
-                    HudDensity::Full => "Full",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut density, HudDensity::Auto, "Auto");
-                    ui.selectable_value(&mut density, HudDensity::Compact, "Compact");
-                    ui.selectable_value(&mut density, HudDensity::Full, "Full");
-                });
-            if density != self.hud_density {
-                self.hud_density = density;
-            }
-
-            // ------------- Mini-plot toggle -------------
-            ui.checkbox(&mut self.show_mini_plot, "📈 Mini-plot");
+            // ------------- Stats window toggle -------------
+            ui.checkbox(&mut self.show_stats_window, "📊 Show Stats");
         });
     }
 
@@ -308,19 +293,21 @@ impl MiraiTrace {
         // Stable, fixed-width readout so the bar never jumps around.
         let op = stats.last_operator_label.as_deref().unwrap_or("-");
 
-        let (w_add, w_move, w_recolor) = {
+        let (w_add, w_remove, w_move, w_recolor) = {
             let mut add = 0.0;
+            let mut rem = 0.0;
             let mut mv = 0.0;
             let mut rc = 0.0;
             for (label, w) in &stats.operator_weights {
                 match label.as_str() {
                     "Add" => add = *w,
+                    "Remove" => rem = *w,
                     "Move" => mv = *w,
                     "Recolor" => rc = *w,
                     _ => {}
                 }
             }
-            (add, mv, rc)
+            (add, rem, mv, rc)
         };
 
         let accept_pct = stats.recent_acceptance_percent;
@@ -343,8 +330,8 @@ impl MiraiTrace {
             ));
         } else {
             ui.label(format!(
-                "op:{:<7} | wA:{:>4.2} wM:{:>4.2} wR:{:>4.2} | acc:{:>5.1}% (win {}) | err:{:>12} best:{:>12} Δ:{:>8} | tris:{:>6} gen:{:>8} | Props/s:{:>6.1} Accepts/s:{:>6.1} ",
-                op, w_add, w_move, w_recolor, accept_pct, accept_win, curr_err, best_err, delta, tri, gen, pps, aps,
+                "op:{:<7} | wA:{:>4.2} wRm:{:>4.2} wM:{:>4.2} wRc:{:>4.2} | acc:{:>5.1}% (win {}) | err:{:>12} best:{:>12} Δ:{:>8} | tris:{:>6} gen:{:>8} | Props/s:{:>6.1} Accepts/s:{:>6.1} ",
+                op, w_add, w_remove, w_move, w_recolor, accept_pct, accept_win, curr_err, best_err, delta, tri, gen, pps, aps,
             ));
         }
 
@@ -470,12 +457,171 @@ impl eframe::App for MiraiTrace {
             }
         });
 
-        // ---------- Bottom HUD ----------
-        egui::TopBottomPanel::bottom("bottom_hud")
-            .resizable(false)
-            .show(ctx, |ui| {
-                self.bottom_hud(ui);
-            });
+        // ---------- Floating Stats Window ----------
+        if self.show_stats_window {
+            egui::Window::new("📊 Statistics")
+                .default_pos([10.0, 60.0])
+                .default_size([450.0, 350.0])
+                .resizable(true)
+                .collapsible(true)
+                .show(ctx, |ui| {
+                    self.stats_window_content(ui);
+                });
+        }
+
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+}
+
+impl MiraiTrace {
+    /// Content for the floating stats window
+    fn stats_window_content(&mut self, ui: &mut egui::Ui) {
+        let stats: EvolutionStats = self.engine.capture_stats_snapshot();
+
+        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+
+        // Decide density
+        let use_compact = match self.hud_density {
+            HudDensity::Compact => true,
+            HudDensity::Full => false,
+            HudDensity::Auto => ui.available_width() < 400.0,
+        };
+
+        // --- Core Stats ---
+        ui.heading("Core Stats");
+        ui.separator();
+
+        let tri = stats.triangle_count;
+        let gen = stats.generation_counter;
+        let curr_err = stats.current_error.unwrap_or(0);
+        let best_err = stats.best_error.unwrap_or(0);
+        let delta = stats.last_accept_delta.unwrap_or(0);
+
+        ui.label(format!("Triangles:    {:>6}", tri));
+        ui.label(format!("Generation:   {:>8}", gen));
+        ui.label(format!("Current error: {:>12}", curr_err));
+        ui.label(format!("Best error:    {:>12}", best_err));
+        ui.label(format!("Last delta:    {:>8}", delta));
+
+        ui.add_space(10.0);
+
+        // --- Performance ---
+        ui.heading("Performance");
+        ui.separator();
+
+        let pps = stats.proposals_per_second;
+        let aps = stats.accepts_per_second;
+        let accept_pct = stats.recent_acceptance_percent;
+        let accept_win = stats.recent_window_size;
+
+        ui.label(format!("Proposals/sec: {:>6.1}", pps));
+        ui.label(format!("Accepts/sec:   {:>6.1}", aps));
+        ui.label(format!("Acceptance:    {:>5.1}% (win {})", accept_pct, accept_win));
+
+        ui.add_space(10.0);
+
+        // --- Operators ---
+        ui.heading("Mutation Operators");
+        ui.separator();
+
+        let op = stats.last_operator_label.as_deref().unwrap_or("-");
+        ui.label(format!("Last operator: {}", op));
+
+        let (w_add, w_remove, w_move, w_recolor) = {
+            let mut add = 0.0;
+            let mut rem = 0.0;
+            let mut mv = 0.0;
+            let mut rc = 0.0;
+            for (label, w) in &stats.operator_weights {
+                match label.as_str() {
+                    "Add" => add = *w,
+                    "Remove" => rem = *w,
+                    "Move" => mv = *w,
+                    "Recolor" => rc = *w,
+                    _ => {}
+                }
+            }
+            (add, rem, mv, rc)
+        };
+
+        if !use_compact {
+            ui.label(format!("  Add:     {:>4.2}", w_add));
+            ui.label(format!("  Remove:  {:>4.2}", w_remove));
+            ui.label(format!("  Move:    {:>4.2}", w_move));
+            ui.label(format!("  Recolor: {:>4.2}", w_recolor));
+        }
+
+        ui.add_space(10.0);
+
+        // --- Annealing ---
+        if let Some(t) = stats.anneal_temp {
+            ui.heading("Annealing");
+            ui.separator();
+            ui.label(format!("Temperature: {:.3}", t));
+            ui.add_space(10.0);
+        }
+
+        // --- Uphill Acceptance ---
+        ui.heading("Uphill Acceptance");
+        ui.separator();
+        ui.label(format!(
+            "Rate: {:.1}% ({} / {})",
+            stats.recent_uphill_acceptance_percent,
+            stats.total_uphill_accepts,
+            stats.total_uphill_attempts
+        ));
+
+        ui.add_space(10.0);
+
+        // --- Error History Plot ---
+        if self.show_mini_plot && !stats.error_history.is_empty() {
+            ui.heading("Error History");
+            ui.separator();
+
+            let plot_height = 120.0;
+            let plot_response = ui.allocate_response(
+                egui::vec2(ui.available_width(), plot_height),
+                egui::Sense::hover(),
+            );
+            let rect = plot_response.rect;
+            let painter = ui.painter_at(rect);
+
+            let series = &stats.error_history;
+            let min_v = *series.iter().min().unwrap();
+            let max_v = *series.iter().max().unwrap();
+            let span = (max_v.saturating_sub(min_v)).max(1);
+
+            let n = series.len();
+            for i in 1..n {
+                let x0 = rect.left() + (i as f32 - 1.0) / (n - 1) as f32 * rect.width();
+                let x1 = rect.left() + (i as f32) / (n - 1) as f32 * rect.width();
+
+                let y0 = rect.bottom()
+                    - ((series[i - 1] - min_v) as f32 / span as f32) * rect.height();
+                let y1 = rect.bottom()
+                    - ((series[i] - min_v) as f32 / span as f32) * rect.height();
+
+                painter.line_segment(
+                    [egui::pos2(x0, y0), egui::pos2(x1, y1)],
+                    egui::Stroke::new(2.0, ui.visuals().text_color()),
+                );
+            }
+        }
+
+        // --- HUD Controls ---
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("HUD Density:");
+            let mut density = self.hud_density;
+            ui.radio_value(&mut density, HudDensity::Compact, "Compact");
+            ui.radio_value(&mut density, HudDensity::Full, "Full");
+            ui.radio_value(&mut density, HudDensity::Auto, "Auto");
+            if density != self.hud_density {
+                self.hud_density = density;
+            }
+        });
+
+        ui.checkbox(&mut self.show_mini_plot, "Show error plot");
     }
 }

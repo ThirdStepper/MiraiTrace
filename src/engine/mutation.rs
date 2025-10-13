@@ -53,22 +53,25 @@ fn move_vertex_jitter_for_phase(phase: f32) -> i32 {
 #[derive(Clone, Copy, Debug)]
 pub enum MutationOperator {
     AddTriangle,
+    RemoveTriangle,
     MoveVertex,
     Recolor,
 }
 
 impl MutationOperator {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 4;
     pub fn index(self) -> usize {
         match self {
             MutationOperator::AddTriangle => 0,
-            MutationOperator::MoveVertex => 1,
-            MutationOperator::Recolor => 2,
+            MutationOperator::RemoveTriangle => 1,
+            MutationOperator::MoveVertex => 2,
+            MutationOperator::Recolor => 3,
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             MutationOperator::AddTriangle => "Add",
+            MutationOperator::RemoveTriangle => "Remove",
             MutationOperator::MoveVertex => "Move",
             MutationOperator::Recolor => "Recolor",
         }
@@ -141,13 +144,14 @@ fn pick_error_weighted_tile(tile_grid: &TileGrid, rng: &mut PcgRng) -> (usize, u
 }
 
 /// Take a representative color from the target inside a tile (average of K random pixels).
+/// Samples more pixels for better color accuracy.
 fn sample_average_target_color_in_tile(
     target_rgba: &[u8],
     canvas_w: usize,
     canvas_h: usize,
     tile_grid: &TileGrid,
     tile_xy: (usize, usize),
-    tri_count: usize,        // ← ADDED
+    tri_count: usize,
     rng: &mut PcgRng,
 ) -> [u8; 4] {
     let (tx, ty) = tile_xy;
@@ -160,8 +164,8 @@ fn sample_average_target_color_in_tile(
     let mut acc_g: u64 = 0;
     let mut acc_b: u64 = 0;
 
-    // Keep sampling cheap; cap at 16 or the tile area.
-    let samples = 16.min(((x1 - x0) * (y1 - y0)).max(1));
+    // Increased sample count from 16 to 64 for better color accuracy
+    let samples = 64.min(((x1 - x0) * (y1 - y0)).max(1));
     for _ in 0..samples {
         let x = rng.gen_range(x0..x1);
         let y = rng.gen_range(y0..y1);
@@ -176,10 +180,14 @@ fn sample_average_target_color_in_tile(
 
     // Painterly alpha: early = stronger coverage, later = gentle glaze
     let tiles_total = tile_grid.tiles_x * tile_grid.tiles_y;
-    let phase = growth_phase(tri_count, tiles_total, 8); // try 8–10 if you want longer “big stroke” period
+    let phase = growth_phase(tri_count, tiles_total, 8);
     let a = alpha_for_phase(phase);
 
-    [r, g, b, a]
+    // Add slight jitter to alpha to create more varied opacity (±10%)
+    let alpha_jitter = rng.gen_range(-25..=25);
+    let a_jittered = (a as i32 + alpha_jitter).clamp(30, 220) as u8;
+
+    [r, g, b, a_jittered]
 }
 
 /// Create a triangle roughly centered in the given tile, with vertices scattered
@@ -273,7 +281,7 @@ pub(super) fn propose_mutation_with_bbox(
             );
 
             // 3) Spawn a triangle centered in that tile with painterly radius (big→small).
-            let tri = triangle_centered_in_tile(
+            let mut tri = triangle_centered_in_tile(
                 canvas_w as usize,
                 canvas_h as usize,
                 tile_grid,
@@ -282,6 +290,12 @@ pub(super) fn propose_mutation_with_bbox(
                 dna2.triangles.len(), // tri_count for scheduling
                 rng,
             );
+
+            // Add slight color variation to avoid identical triangles (±5 in RGB)
+            let color_var = 5i32;
+            tri.r = (tri.r as i32 + rng.gen_range(-color_var..=color_var)).clamp(0, 255) as u8;
+            tri.g = (tri.g as i32 + rng.gen_range(-color_var..=color_var)).clamp(0, 255) as u8;
+            tri.b = (tri.b as i32 + rng.gen_range(-color_var..=color_var)).clamp(0, 255) as u8;
 
             let new_index = dna2.triangles.len();
             dna2.triangles.push(tri);
@@ -292,6 +306,35 @@ pub(super) fn propose_mutation_with_bbox(
                 affected_bbox_px: bbox,
                 changed_index: Some(new_index),
                 old_triangle_for_update: None,
+                op,
+            }
+        }
+        MutationOperator::RemoveTriangle => {
+            // Remove a random triangle
+            if current_dna.triangles.is_empty() || current_dna.triangles.len() < 10 {
+                // Don't remove if we have too few triangles - add instead
+                return propose_mutation_with_bbox(
+                    current_dna,
+                    rng,
+                    canvas_w,
+                    canvas_h,
+                    max_tris,
+                    MutationOperator::AddTriangle,
+                    tile_grid,
+                    target_rgba,
+                );
+            }
+
+            let mut dna2 = current_dna.clone();
+            let idx = rng.gen_range(0..dna2.triangles.len());
+            let removed = dna2.triangles.remove(idx);
+            let bbox = triangle_bbox_px(&removed, canvas_w as usize, canvas_h as usize);
+
+            Proposal {
+                candidate_dna_out: dna2,
+                affected_bbox_px: bbox,
+                changed_index: None,  // No single triangle changed
+                old_triangle_for_update: Some(removed),
                 op,
             }
         }

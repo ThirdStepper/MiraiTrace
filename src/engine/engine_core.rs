@@ -211,13 +211,6 @@ impl EvolutionEngine {
                         // Re-initialize the annealer on a fresh baseline
                         sa = SimAnneal::new();
 
-                        // ---- EWMA SEED (per-pixel SSE from the baseline) ----
-                        let pixels = (s.width as f64) * (s.height as f64);
-                        if pixels > 0.0 {
-                            // Safe to touch private fields here (same module/file)
-                            sa.ppsse_ewma = (tiles_sum as f64 / pixels).max(1.0);
-                        }
-
                         // HUD stats from tiles_sum
                         s.stats.current_error = Some(tiles_sum);
                         s.stats.best_error = Some(tiles_sum);
@@ -253,96 +246,42 @@ impl EvolutionEngine {
                     let tiles_total = grid_snapshot.tiles_x * grid_snapshot.tiles_y;
                     let growth_target = (tiles_total.saturating_mul(8)).clamp(64, max_tris_cap.max(64));
 
-                    // Choose an operator and propose a mutation guided by tile errors
+                    // Choose an operator
                     let op = scheduler.sample_operator(&mut rng, dna_snapshot.triangles.len(), growth_target);
-                    let mut proposal = propose_mutation_with_bbox(
-                        &dna_snapshot, &mut rng,
-                        canvas_w as i32, canvas_h as i32,
-                        max_tris_cap, op,
-                        &grid_snapshot, &target_rgba,
-                    );
 
-                    // Geometry-true affected rect (old ⊔ new), *not* tile-aligned
-                    let mut union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
-                    if union_rect.w == 0 || union_rect.h == 0 { continue; }
-                                    
-                    // Now pick tiles to update SSE from this rect (tile-aligned only for SSE)
-                    let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
-                    let mut tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
-                    if tiles_touched.is_empty() { continue; }
-
-                    // Compose candidate buffer for the union rect
-                    scratch_region.resize(union_rect.w * union_rect.h * 4, 0);
-                    fill_region_rgba_solid(&mut scratch_region, &union_rect, bg_rgba);
-                    compose_candidate_region_with_culled_subset(
-                        &mut scratch_region, &union_rect, canvas_w, canvas_h,
-                        &dna_snapshot, &mut index_snapshot,
-                        proposal.changed_index, &proposal.candidate_dna_out,
-                    );
-
-                    // Current error over EXACT rect (not whole tiles) — used for cutoff and exact recompute
-                    let current_error_in_rect = {
-                        let s = shared_mutex.lock();
-                        total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
+                    // BATCH MUTATION SAMPLING: Try N candidates, keep the best
+                    // This is the key improvement - we always make progress!
+                    let batch_size = if dna_snapshot.triangles.len() < growth_target {
+                        20  // Larger batches during growth phase
+                    } else {
+                        10  // Smaller batches during refinement
                     };
 
-                    // Fast candidate estimate with a cutoff for quick rejection
-                    let candidate_error_in_rect = total_sse_region_with_cutoff(
-                        &scratch_region, &target_rgba, canvas_w, &union_rect, current_error_in_rect);
+                    // Batch sampling: try multiple candidates, keep the best
+                    let mut best_candidate_error = current_total_error;  // Start with current as baseline
+                    let mut best_proposal = None;
+                    let mut best_union_rect = IntRect::empty();
+                    let mut best_tiles_touched = Vec::new();
+                    let mut best_scratch_region = Vec::new();
 
-                    // Combine with checked subtraction
-                    let mut candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
-                        Some(rest) => rest + candidate_error_in_rect,
-                        None => {
-                            // Should be rare; fall back to grid truth
-                            let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
-                            base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
-                        }
-                    };
+                    for batch_idx in 0..batch_size {
+                        let proposal = propose_mutation_with_bbox(
+                            &dna_snapshot, &mut rng,
+                            canvas_w as i32, canvas_h as i32,
+                            max_tris_cap, op,
+                            &grid_snapshot, &target_rgba,
+                        );
 
-                    // Best-of-K recolor: try several color variants in the *same* geometry rect
-                    if matches!(op, MutationOperator::Recolor) {
-                        let k = 4usize;
-                        let mut best = (candidate_total_error, proposal.clone(), tiles_touched.clone(), union_rect, candidate_error_in_rect, current_error_in_rect);
-                        for _ in 1..k {
-                            let p2 = propose_mutation_with_bbox(&dna_snapshot, &mut rng, canvas_w as i32, canvas_h as i32, max_tris_cap, op, &grid_snapshot, &target_rgba);
-                            
-                            let rect2 = pad_and_clamp_rect(p2.affected_bbox_px, 2, canvas_w, canvas_h);
-                            if rect2.w == 0 || rect2.h == 0 { continue; }
-                            let tiles2 = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
-                            if tiles2.is_empty() { continue; }
+                        // Geometry-true affected rect (old ⊔ new), *not* tile-aligned
+                        let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
+                        if union_rect.w == 0 || union_rect.h == 0 { continue; }
 
-                            scratch_region.resize(rect2.w * rect2.h * 4, 0);
-                            fill_region_rgba_solid(&mut scratch_region, &rect2, bg_rgba);
-                            compose_candidate_region_with_culled_subset(
-                                &mut scratch_region, &rect2, canvas_w, canvas_h,
-                                &dna_snapshot, &mut index_snapshot,
-                                p2.changed_index, &p2.candidate_dna_out,
-                            );
+                        // Now pick tiles to update SSE from this rect (tile-aligned only for SSE)
+                        let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
+                        let tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
+                        if tiles_touched.is_empty() { continue; }
 
-                            let cur2 = {
-                                let s = shared_mutex.lock();
-                                total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &rect2)
-                            };
-
-                            let cand2 = total_sse_region_with_cutoff(&scratch_region, &target_rgba, canvas_w, &rect2, cur2);
-
-                            let cand_total2 = match current_total_error.checked_sub(cur2) { Some(rest) => rest + cand2, None => {
-                                let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
-                                base.saturating_sub(cur2) + cand2
-                            }};
-
-                            if cand_total2 < best.0 { best = (cand_total2, p2, tiles2, rect2, cand2, cur2); }
-                        }
-
-                        // Adopt winner (region + errors!) and recompose for it
-                        //candidate_total_error = best.0;
-                        proposal              = best.1;
-                        tiles_touched         = best.2;
-                        union_rect            = best.3;
-                        //candidate_error_in_rect = best.4;
-                        //current_error_in_rect   = best.5;
-
+                        // Compose candidate buffer for the union rect
                         scratch_region.resize(union_rect.w * union_rect.h * 4, 0);
                         fill_region_rgba_solid(&mut scratch_region, &union_rect, bg_rgba);
                         compose_candidate_region_with_culled_subset(
@@ -350,7 +289,67 @@ impl EvolutionEngine {
                             &dna_snapshot, &mut index_snapshot,
                             proposal.changed_index, &proposal.candidate_dna_out,
                         );
+
+                        // Current error over EXACT rect
+                        let current_error_in_rect = {
+                            let s = shared_mutex.lock();
+                            total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
+                        };
+
+                        // Fast candidate estimate
+                        let candidate_error_in_rect = total_sse_region_with_cutoff(
+                            &scratch_region, &target_rgba, canvas_w, &union_rect, current_error_in_rect);
+
+                        // Calculate total error for this candidate
+                        let candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
+                            Some(rest) => rest + candidate_error_in_rect,
+                            None => {
+                                let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
+                                base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
+                            }
+                        };
+
+                        // Keep this candidate if it's the best so far
+                        if candidate_total_error < best_candidate_error {
+                            best_candidate_error = candidate_total_error;
+                            best_proposal = Some(proposal);
+                            best_union_rect = union_rect;
+                            best_tiles_touched = tiles_touched;
+                            best_scratch_region = scratch_region.clone();
+                        }
                     }
+
+                    // If no candidate improved, skip this iteration
+                    if best_proposal.is_none() {
+                        sa.note_no_improvement();
+                        continue;
+                    }
+
+                    // Unwrap the best candidate
+                    let mut proposal = best_proposal.unwrap();
+                    let mut union_rect = best_union_rect;
+                    let mut tiles_touched = best_tiles_touched;
+                    scratch_region = best_scratch_region;
+
+                    // Recalculate final exact errors for the winner
+                    let mut current_error_in_rect = {
+                        let s = shared_mutex.lock();
+                        total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
+                    };
+
+                    let mut candidate_error_in_rect = total_squared_error_rgb_region_from_buffer_vs_target(
+                        &scratch_region, &target_rgba, canvas_w, &union_rect);
+
+                    let mut candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
+                        Some(rest) => rest + candidate_error_in_rect,
+                        None => {
+                            let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
+                            base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
+                        }
+                    };
+
+                    // Batch sampling already handled finding the best candidate
+                    // No need for separate Best-of-K recolor logic
 
                     // Final exact recompute (no cutoff) before acceptance decision
                     let exact_current_in_rect = {
@@ -439,8 +438,9 @@ impl EvolutionEngine {
                         s.stats.last_tiles_touched = Some(tiles_touched.len());
                         s.stats.operator_weights = vec![
                             ("Add".into(), op_weights[0]),
-                            ("Move".into(), op_weights[1]),
-                            ("Recolor".into(), op_weights[2]),
+                            ("Remove".into(), op_weights[1]),
+                            ("Move".into(), op_weights[2]),
+                            ("Recolor".into(), op_weights[3]),
                         ];
                         s.stats.max_triangles_cap = s.max_triangles_cap;
                     
@@ -448,21 +448,12 @@ impl EvolutionEngine {
                         s.stats.anneal_temp = Some(sa.temp()); // or f64 if that’s your field type
                     }
 
-                    if pre_cap {
-                        // Peek last window uphill % from a snapshot to avoid holding the lock
-                        let (uphill_pct, _) = {
-                            let s = shared_mutex.lock();
-                            (s.stats.recent_uphill_acceptance_percent, s.window_started_at)
-                        };
-                        if uphill_pct > 25.0 {
-                            sa.nudge_cool(0.96); // small cool-down nudge
-                        }
-                    }
+                    // Removed aggressive phase-based cooling - let the annealer manage its own temperature
+                    // The annealer's adaptive mechanism and set_phase() provide sufficient control
 
-                    // Rejected → count no-improvement, cool one tick, move on.
+                    // Rejected → count no-improvement, move on.
                     if !accepted {
                         sa.note_no_improvement();
-                        sa.tick();
                         continue;
                     }
 
@@ -498,7 +489,6 @@ impl EvolutionEngine {
                         } else {
                             sa.note_no_improvement();
                         }
-                        sa.tick();
                     
                         // -------- original commit body (unchanged) --------
                         s.current_total_squared_error = Some(tiles_sum);
@@ -529,6 +519,11 @@ impl EvolutionEngine {
                                     let tri = &s.dna.triangles[idx];
                                     si.insert_triangle(idx, tri, w2, h2);
                                 }
+                            }
+                            MutationOperator::RemoveTriangle => {
+                                // Removal shifts all indices down - just rebuild
+                                let dna_clone = s.dna.clone();
+                                si.rebuild(&dna_clone, w2, h2);
                             }
                             MutationOperator::MoveVertex => {
                                 if let Some(idx) = proposal.changed_index {
