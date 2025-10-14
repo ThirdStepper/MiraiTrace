@@ -50,8 +50,6 @@ pub struct MiraiTrace {
     show_canvas_only: bool,
 
     // HUD options
-    hud_density: HudDensity,
-    show_mini_plot: bool,
     show_stats_window: bool,  // Toggle for floating stats window
 
     // Canvas clear color (UI model). Changing it clears/rebaselines the engine.
@@ -85,8 +83,6 @@ impl MiraiTrace {
             original_width: 0,
             original_height: 0,
             show_canvas_only: false,
-            hud_density: HudDensity::Auto,
-            show_mini_plot: true,
             show_stats_window: true,  // Show stats by default
             canvas_clear_color: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255), // default white
         }
