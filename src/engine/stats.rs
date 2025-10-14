@@ -36,6 +36,9 @@ pub struct EvolutionStats {
     pub recent_uphill_acceptance_percent: f32, // uphill accepts / uphill attempts * 100 over last window
     pub total_uphill_attempts: u64,            // lifetime uphill attempts
     pub total_uphill_accepts: u64,             // lifetime uphill accepts
+
+    // Active compute backend
+    pub active_backend: String,                // "CPU" or "WGPU GPU" or "WGPU GPU (fallback to CPU)"
 }
 
 impl EvolutionStats {
