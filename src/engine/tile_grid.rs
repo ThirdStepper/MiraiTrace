@@ -270,42 +270,6 @@ impl TileGrid {
     }
 
     /// Compute a tight region (in pixels) that covers a set of tiles.
-    #[allow(dead_code)]
-    pub(crate) fn union_rect_for_tiles(
-        &self,
-        tiles: &[(usize, usize)],
-        canvas_w: usize,
-        canvas_h: usize,
-    ) -> IntRect {
-        if tiles.is_empty() {
-            return IntRect { x: 0, y: 0, w: 0, h: 0 };
-        }
-
-        let mut tx_min = self.tiles_x - 1;
-        let mut ty_min = self.tiles_y - 1;
-        let mut tx_max = 0usize;
-        let mut ty_max = 0usize;
-        for &(tx, ty) in tiles {
-            tx_min = tx_min.min(tx);
-            ty_min = ty_min.min(ty);
-            tx_max = tx_max.max(tx);
-            ty_max = ty_max.max(ty);
-        }
-
-        let x  = tx_min * self.tile_size;
-        let y  = ty_min * self.tile_size;
-        let xe = ((tx_max + 1) * self.tile_size).min(canvas_w); // exclusive
-        let ye = ((ty_max + 1) * self.tile_size).min(canvas_h); // exclusive
-        IntRect { x, y, w: xe - x, h: ye - y }
-    }
-
-    #[allow(dead_code)]
-    pub fn sum_error_for_tiles(&self, tiles: &[(usize, usize)]) -> u64 {
-        tiles
-            .iter()
-            .map(|&(tx, ty)| self.sse_per_tile[self.tile_index(tx, ty)])
-            .sum()
-    }
 
     /// After accepting a candidate, recompute SSE for each affected tile by comparing
     /// current canvas vs target. This touches only the small set of tiles provided.
