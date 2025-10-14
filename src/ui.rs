@@ -21,7 +21,7 @@ use eframe::{egui, egui::ColorImage};
 use egui::{Context, Margin, TextureHandle, TextureOptions, Vec2};
 use std::path::Path;
 
-use crate::engine::{EvolutionEngine, EvolutionStats};
+use crate::engine::{EvolutionEngine, EvolutionStats, ComputeBackendType};
 
 /// How much HUD to show.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +216,66 @@ impl MiraiTrace {
                 let _ = self.save_canvas_as_png();
             }
 
+            // Export SVG
+            if ui
+                .button("📄 Export SVG")
+                .on_hover_text("Export the current triangles as an SVG file")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("vectorgazo.svg")
+                    .add_filter("SVG", &["svg"])
+                    .save_file()
+                {
+                    match self.engine.export_svg(&path) {
+                        Ok(_) => {},
+                        Err(e) => eprintln!("Failed to export SVG: {}", e),
+                    }
+                }
+            }
+
+            ui.separator();
+
+            // Save DNA
+            if ui
+                .button("💾 Save DNA")
+                .on_hover_text("Save the current triangle DNA to a JSON file")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("dna.json")
+                    .add_filter("JSON", &["json"])
+                    .save_file()
+                {
+                    match self.engine.save_dna_to_file(&path) {
+                        Ok(_) => {},
+                        Err(e) => eprintln!("Failed to save DNA: {}", e),
+                    }
+                }
+            }
+
+            // Load DNA
+            if ui
+                .button("📂 Load DNA")
+                .on_hover_text("Load triangle DNA from a JSON file (replaces current DNA)")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .pick_file()
+                {
+                    match self.engine.load_dna_from_file(&path) {
+                        Ok(_) => {
+                            // Force re-upload of canvas on next frame
+                            self.last_uploaded_generation = 0;
+                        },
+                        Err(e) => eprintln!("Failed to load DNA: {}", e),
+                    }
+                }
+            }
+
+            ui.separator();
+
             // Run / Pause toggle
             let is_running = self.engine.is_running();
             let btn_label = if is_running { "⏸ Pause" } else { "▶ Run" };
@@ -274,6 +334,37 @@ impl MiraiTrace {
 
             // ------------- Stats window toggle -------------
             ui.checkbox(&mut self.show_stats_window, "📊 Show Stats");
+
+            ui.separator();
+
+            // ------------- Compute Backend Selector -------------
+            ui.label("Compute:");
+            let current_backend = self.engine.get_compute_backend();
+
+            // CPU option (always available)
+            let cpu_selected = ui.selectable_label(
+                current_backend == ComputeBackendType::Cpu,
+                "CPU"
+            ).clicked();
+
+            // WGPU GPU option (only if available)
+            let wgpu_available = ComputeBackendType::Wgpu.is_available();
+            let wgpu_label = if wgpu_available { "WGPU GPU" } else { "GPU (N/A)" };
+
+            let mut wgpu_selected = false;
+            ui.add_enabled_ui(wgpu_available, |ui| {
+                wgpu_selected = ui.selectable_label(
+                    current_backend == ComputeBackendType::Wgpu,
+                    wgpu_label
+                ).clicked();
+            });
+
+            // Handle selection changes
+            if cpu_selected {
+                self.engine.set_compute_backend(ComputeBackendType::Cpu);
+            } else if wgpu_selected && wgpu_available {
+                self.engine.set_compute_backend(ComputeBackendType::Wgpu);
+            }
         });
     }
 

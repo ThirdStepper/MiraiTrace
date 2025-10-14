@@ -22,6 +22,7 @@ use std::{
 
 use parking_lot::Mutex;
 use rand_pcg::Pcg64Mcg as PcgRng;
+use rayon::prelude::*;
 
 use super::{
     fill_region_rgba_solid, compose_candidate_region_with_culled_subset,
@@ -35,6 +36,8 @@ use super::{
 };
 use super::mutation::propose_mutation_with_bbox;
 use super::EvolutionStats;
+
+pub use crate::engine::ComputeBackendType;
 
 // -----------------------------------------------------------------------------
 // Shared state (guarded by a mutex)
@@ -76,6 +79,9 @@ struct SharedState {
     // runtime dials
     max_triangles_cap: usize,
     work_budget_per_tick: u32,
+
+    // compute backend selection
+    compute_backend: ComputeBackendType,
 }
 impl Default for SharedState {
     fn default() -> Self {
@@ -99,6 +105,7 @@ impl Default for SharedState {
             uphill_accepts_counter_window: 0,
             max_triangles_cap: 10_000,
             work_budget_per_tick: 5_000,
+            compute_backend: ComputeBackendType::Cpu,
         }
     }
 }
@@ -257,79 +264,85 @@ impl EvolutionEngine {
                         10  // Smaller batches during refinement
                     };
 
-                    // Batch sampling: try multiple candidates, keep the best
-                    let mut best_candidate_error = current_total_error;  // Start with current as baseline
-                    let mut best_proposal = None;
-                    let mut best_union_rect = IntRect::empty();
-                    let mut best_tiles_touched = Vec::new();
-                    let mut best_scratch_region = Vec::new();
-
-                    for batch_idx in 0..batch_size {
-                        let proposal = propose_mutation_with_bbox(
+                    // PARALLEL BATCH SAMPLING: Evaluate N candidates in parallel, keep the best
+                    // Generate all proposals first (sequential with shared RNG)
+                    let mut proposals = Vec::with_capacity(batch_size);
+                    for _ in 0..batch_size {
+                        proposals.push(propose_mutation_with_bbox(
                             &dna_snapshot, &mut rng,
                             canvas_w as i32, canvas_h as i32,
                             max_tris_cap, op,
                             &grid_snapshot, &target_rgba,
-                        );
+                        ));
+                    }
 
-                        // Geometry-true affected rect (old ⊔ new), *not* tile-aligned
-                        let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
-                        if union_rect.w == 0 || union_rect.h == 0 { continue; }
+                    // Get canvas snapshot for parallel evaluation
+                    let canvas_snapshot = {
+                        let s = shared_mutex.lock();
+                        s.pixel_backbuffer_rgba.clone()
+                    };
 
-                        // Now pick tiles to update SSE from this rect (tile-aligned only for SSE)
-                        let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
-                        let tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
-                        if tiles_touched.is_empty() { continue; }
+                    // Evaluate all candidates IN PARALLEL
+                    let evaluated_candidates: Vec<_> = proposals
+                        .into_par_iter()
+                        .filter_map(|proposal| {
+                            // Each thread gets its own scratch buffer and index snapshot
+                            let mut index_snapshot_local = index_snapshot.clone();
+                            let mut scratch_region_local = Vec::new();
 
-                        // Compose candidate buffer for the union rect
-                        scratch_region.resize(union_rect.w * union_rect.h * 4, 0);
-                        fill_region_rgba_solid(&mut scratch_region, &union_rect, bg_rgba);
-                        compose_candidate_region_with_culled_subset(
-                            &mut scratch_region, &union_rect, canvas_w, canvas_h,
-                            &dna_snapshot, &mut index_snapshot,
-                            proposal.changed_index, &proposal.candidate_dna_out,
-                        );
+                            // Geometry-true affected rect
+                            let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
+                            if union_rect.w == 0 || union_rect.h == 0 { return None; }
 
-                        // Current error over EXACT rect
-                        let current_error_in_rect = {
-                            let s = shared_mutex.lock();
-                            total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
-                        };
+                            // Pick tiles
+                            let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
+                            let tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
+                            if tiles_touched.is_empty() { return None; }
 
-                        // Fast candidate estimate
-                        let candidate_error_in_rect = total_sse_region_with_cutoff(
-                            &scratch_region, &target_rgba, canvas_w, &union_rect, current_error_in_rect);
+                            // Compose candidate buffer
+                            scratch_region_local.resize(union_rect.w * union_rect.h * 4, 0);
+                            fill_region_rgba_solid(&mut scratch_region_local, &union_rect, bg_rgba);
+                            compose_candidate_region_with_culled_subset(
+                                &mut scratch_region_local, &union_rect, canvas_w, canvas_h,
+                                &dna_snapshot, &mut index_snapshot_local,
+                                proposal.changed_index, &proposal.candidate_dna_out,
+                            );
 
-                        // Calculate total error for this candidate
-                        let candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
-                            Some(rest) => rest + candidate_error_in_rect,
-                            None => {
-                                let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
-                                base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
-                            }
-                        };
+                            // Current error over EXACT rect (no lock needed - using snapshot)
+                            let current_error_in_rect = total_squared_error_rgb_region_from_canvas_vs_target(
+                                &canvas_snapshot, &target_rgba, canvas_w, &union_rect);
 
-                        // Keep this candidate if it's the best so far
-                        if candidate_total_error < best_candidate_error {
-                            best_candidate_error = candidate_total_error;
-                            best_proposal = Some(proposal);
-                            best_union_rect = union_rect;
-                            best_tiles_touched = tiles_touched;
-                            best_scratch_region = scratch_region.clone();
+                            // Fast candidate estimate
+                            let candidate_error_in_rect = total_sse_region_with_cutoff(
+                                &scratch_region_local, &target_rgba, canvas_w, &union_rect, current_error_in_rect);
+
+                            // Calculate total error for this candidate
+                            let candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
+                                Some(rest) => rest + candidate_error_in_rect,
+                                None => {
+                                    let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
+                                    base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
+                                }
+                            };
+
+                            Some((candidate_total_error, proposal, union_rect, tiles_touched, scratch_region_local))
+                        })
+                        .collect();
+
+                    // Find the best candidate sequentially
+                    let best = evaluated_candidates.into_iter()
+                        .min_by_key(|(error, _, _, _, _)| *error);
+
+                    // Unwrap the best candidate (already checked for None above)
+                    let (_, mut proposal, mut union_rect, mut tiles_touched, mut scratch_region_best) = match best {
+                        Some(b) => b,
+                        None => {
+                            sa.note_no_improvement();
+                            continue;
                         }
-                    }
+                    };
 
-                    // If no candidate improved, skip this iteration
-                    if best_proposal.is_none() {
-                        sa.note_no_improvement();
-                        continue;
-                    }
-
-                    // Unwrap the best candidate
-                    let mut proposal = best_proposal.unwrap();
-                    let mut union_rect = best_union_rect;
-                    let mut tiles_touched = best_tiles_touched;
-                    scratch_region = best_scratch_region;
+                    scratch_region = scratch_region_best;
 
                     // Recalculate final exact errors for the winner
                     let mut current_error_in_rect = {
@@ -631,5 +644,93 @@ impl EvolutionEngine {
         let mut stats = s.stats.clone();
         stats.max_triangles_cap = s.max_triangles_cap;
         stats
+    }
+
+    /// Save current DNA to JSON file
+    pub fn save_dna_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let s = self.shared.lock();
+        let json = serde_json::to_string_pretty(&s.dna)
+            .map_err(|e| format!("Failed to serialize DNA: {}", e))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("Failed to write file: {}", e))?;
+        Ok(())
+    }
+
+    /// Load DNA from JSON file and replace current DNA
+    pub fn load_dna_from_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let dna: TriangleDna = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to deserialize DNA: {}", e))?;
+
+        // Replace DNA and force rebaseline
+        let mut s = self.shared.lock();
+        let ts = choose_tile_size(s.width, s.height);
+        s.dna = dna;
+        s.current_total_squared_error = None;  // Force rebaseline
+        s.best_total_squared_error = None;
+        s.generation_counter = 0;
+        s.stats.triangle_count = s.dna.triangles.len();
+
+        // Rebuild spatial index for new DNA
+        let (w, h) = (s.width, s.height);
+        let mut si = TriangleSpatialIndex::new(w, h, ts);
+        si.rebuild(&s.dna, w, h);
+        s.spatial_index = Some(si);
+
+        Ok(())
+    }
+
+    /// Export current DNA to SVG file
+    pub fn export_svg(&self, path: &std::path::Path) -> Result<(), String> {
+        let s = self.shared.lock();
+        let width = s.width;
+        let height = s.height;
+        let triangles = &s.dna.triangles;
+
+        let mut svg = format!(
+            "<svg width=\"{}\" height=\"{}\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+            width, height
+        );
+
+        // Add background rectangle
+        let bg = s.background_color_rgba;
+        svg.push_str(&format!(
+            "  <rect width=\"100%\" height=\"100%\" fill=\"rgb({},{},{})\" />\n",
+            bg[0], bg[1], bg[2]
+        ));
+
+        // Add all triangles
+        for tri in triangles {
+            svg.push_str(&format!(
+                "  <polygon points=\"{},{} {},{} {},{}\" fill=\"rgb({},{},{})\" opacity=\"{}\" />\n",
+                tri.x0, tri.y0,
+                tri.x1, tri.y1,
+                tri.x2, tri.y2,
+                tri.r, tri.g, tri.b,
+                tri.a as f32 / 255.0
+            ));
+        }
+
+        svg.push_str("</svg>");
+
+        std::fs::write(path, svg)
+            .map_err(|e| format!("Failed to write SVG: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get the currently selected compute backend
+    pub fn get_compute_backend(&self) -> ComputeBackendType {
+        let s = self.shared.lock();
+        s.compute_backend
+    }
+
+    /// Set the compute backend (CPU vs OpenCL GPU)
+    pub fn set_compute_backend(&mut self, backend: ComputeBackendType) {
+        let mut s = self.shared.lock();
+        s.compute_backend = backend;
+        // Note: Actual backend implementation in parallel evaluation would go here
+        // For now, this just tracks the selection
     }
 }
