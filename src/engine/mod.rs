@@ -37,6 +37,7 @@ impl ComputeBackendType {
         }
     }
 
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         match self {
             ComputeBackendType::Cpu => "CPU",

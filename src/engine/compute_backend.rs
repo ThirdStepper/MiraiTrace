@@ -7,6 +7,7 @@ use super::{IntRect, Triangle};
 use wgpu::util::DeviceExt;
 
 /// Compute backend trait - defines the interface for CPU/GPU implementations
+#[allow(dead_code)]
 pub trait ComputeBackend: Send + Sync {
     /// Initialize the backend (allocate buffers, compile shaders, etc.)
     fn initialize(&mut self, width: usize, height: usize) -> Result<(), String>;
@@ -40,8 +41,10 @@ pub trait ComputeBackend: Send + Sync {
 }
 
 /// CPU backend - uses the existing CPU rasterization code
+#[allow(dead_code)]
 pub struct CpuBackend;
 
+#[allow(dead_code)]
 impl CpuBackend {
     pub fn new() -> Self {
         Self
@@ -106,6 +109,7 @@ impl ComputeBackend for CpuBackend {
 }
 
 /// WGPU GPU backend with compiled shaders and pipelines
+#[allow(dead_code)]
 pub struct WgpuBackend {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
@@ -123,6 +127,7 @@ pub struct WgpuBackend {
     sse_bind_group_layout: Option<wgpu::BindGroupLayout>,
 }
 
+#[allow(dead_code)]
 impl WgpuBackend {
     pub fn new() -> Self {
         Self {
