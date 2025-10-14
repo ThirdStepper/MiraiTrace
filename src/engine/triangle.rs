@@ -3,10 +3,13 @@
 // -----------------------------------------------------------------------------
 
 use std::cmp::{max,min};
+use serde::{Deserialize, Serialize};
 
 use super::IntRect;
 
-#[derive(Clone, Copy, Debug)]
+// repr(C) ensures memory layout matches GPU expectations
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[repr(C)]
 pub(crate) struct Triangle {
     pub x0: i32, pub y0: i32,
     pub x1: i32, pub y1: i32,
@@ -14,7 +17,7 @@ pub(crate) struct Triangle {
     pub r: u8,  pub g: u8,  pub b: u8,  pub a: u8,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct TriangleDna {
     pub triangles: Vec<Triangle>,
 }

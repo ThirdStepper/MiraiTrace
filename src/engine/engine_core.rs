@@ -37,6 +37,8 @@ use super::{
 use super::mutation::propose_mutation_with_bbox;
 use super::EvolutionStats;
 
+pub use crate::engine::ComputeBackendType;
+
 // -----------------------------------------------------------------------------
 // Shared state (guarded by a mutex)
 // -----------------------------------------------------------------------------
@@ -77,6 +79,9 @@ struct SharedState {
     // runtime dials
     max_triangles_cap: usize,
     work_budget_per_tick: u32,
+
+    // compute backend selection
+    compute_backend: ComputeBackendType,
 }
 impl Default for SharedState {
     fn default() -> Self {
@@ -100,6 +105,7 @@ impl Default for SharedState {
             uphill_accepts_counter_window: 0,
             max_triangles_cap: 10_000,
             work_budget_per_tick: 5_000,
+            compute_backend: ComputeBackendType::Cpu,
         }
     }
 }
@@ -638,5 +644,93 @@ impl EvolutionEngine {
         let mut stats = s.stats.clone();
         stats.max_triangles_cap = s.max_triangles_cap;
         stats
+    }
+
+    /// Save current DNA to JSON file
+    pub fn save_dna_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let s = self.shared.lock();
+        let json = serde_json::to_string_pretty(&s.dna)
+            .map_err(|e| format!("Failed to serialize DNA: {}", e))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("Failed to write file: {}", e))?;
+        Ok(())
+    }
+
+    /// Load DNA from JSON file and replace current DNA
+    pub fn load_dna_from_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let dna: TriangleDna = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to deserialize DNA: {}", e))?;
+
+        // Replace DNA and force rebaseline
+        let mut s = self.shared.lock();
+        let ts = choose_tile_size(s.width, s.height);
+        s.dna = dna;
+        s.current_total_squared_error = None;  // Force rebaseline
+        s.best_total_squared_error = None;
+        s.generation_counter = 0;
+        s.stats.triangle_count = s.dna.triangles.len();
+
+        // Rebuild spatial index for new DNA
+        let (w, h) = (s.width, s.height);
+        let mut si = TriangleSpatialIndex::new(w, h, ts);
+        si.rebuild(&s.dna, w, h);
+        s.spatial_index = Some(si);
+
+        Ok(())
+    }
+
+    /// Export current DNA to SVG file
+    pub fn export_svg(&self, path: &std::path::Path) -> Result<(), String> {
+        let s = self.shared.lock();
+        let width = s.width;
+        let height = s.height;
+        let triangles = &s.dna.triangles;
+
+        let mut svg = format!(
+            "<svg width=\"{}\" height=\"{}\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+            width, height
+        );
+
+        // Add background rectangle
+        let bg = s.background_color_rgba;
+        svg.push_str(&format!(
+            "  <rect width=\"100%\" height=\"100%\" fill=\"rgb({},{},{})\" />\n",
+            bg[0], bg[1], bg[2]
+        ));
+
+        // Add all triangles
+        for tri in triangles {
+            svg.push_str(&format!(
+                "  <polygon points=\"{},{} {},{} {},{}\" fill=\"rgb({},{},{})\" opacity=\"{}\" />\n",
+                tri.x0, tri.y0,
+                tri.x1, tri.y1,
+                tri.x2, tri.y2,
+                tri.r, tri.g, tri.b,
+                tri.a as f32 / 255.0
+            ));
+        }
+
+        svg.push_str("</svg>");
+
+        std::fs::write(path, svg)
+            .map_err(|e| format!("Failed to write SVG: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get the currently selected compute backend
+    pub fn get_compute_backend(&self) -> ComputeBackendType {
+        let s = self.shared.lock();
+        s.compute_backend
+    }
+
+    /// Set the compute backend (CPU vs OpenCL GPU)
+    pub fn set_compute_backend(&mut self, backend: ComputeBackendType) {
+        let mut s = self.shared.lock();
+        s.compute_backend = backend;
+        // Note: Actual backend implementation in parallel evaluation would go here
+        // For now, this just tracks the selection
     }
 }
