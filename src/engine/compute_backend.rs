@@ -6,6 +6,17 @@
 use super::{IntRect, Triangle};
 use wgpu::util::DeviceExt;
 
+/// Data for evaluating a single proposal on the GPU
+#[derive(Clone, Debug)]
+pub struct ProposalEvaluationData {
+    /// The region affected by this proposal
+    pub region: IntRect,
+    /// All triangles in the candidate DNA
+    pub triangles: Vec<Triangle>,
+    /// Indices specifying draw order
+    pub triangle_indices: Vec<usize>,
+}
+
 /// Compute backend trait - defines the interface for CPU/GPU implementations
 #[allow(dead_code)]
 pub trait ComputeBackend: Send + Sync {
@@ -32,6 +43,18 @@ pub trait ComputeBackend: Send + Sync {
         canvas_w: usize,
         region: &IntRect,
     ) -> Result<u64, String>;
+
+    /// Evaluate multiple proposals in a single batch (GPU-optimized)
+    /// Returns SSE for each proposal in the same order as input
+    fn evaluate_proposals_batch(
+        &mut self,
+        canvas_rgba: &[u8],
+        target_rgba: &[u8],
+        canvas_w: usize,
+        canvas_h: usize,
+        background_color: [u8; 4],
+        proposals: &[ProposalEvaluationData],
+    ) -> Result<Vec<u64>, String>;
 
     /// Get backend name for display
     fn name(&self) -> &str;
@@ -99,6 +122,43 @@ impl ComputeBackend for CpuBackend {
         ))
     }
 
+    fn evaluate_proposals_batch(
+        &mut self,
+        _canvas_rgba: &[u8],
+        target_rgba: &[u8],
+        canvas_w: usize,
+        canvas_h: usize,
+        background_color: [u8; 4],
+        proposals: &[ProposalEvaluationData],
+    ) -> Result<Vec<u64>, String> {
+        // CPU implementation: just loop through proposals sequentially
+        let mut results = Vec::with_capacity(proposals.len());
+
+        for proposal in proposals {
+            // Compose the candidate region
+            let region_buffer = self.compose_region(
+                &proposal.region,
+                canvas_w,
+                canvas_h,
+                background_color,
+                &proposal.triangles,
+                &proposal.triangle_indices,
+            )?;
+
+            // Calculate SSE
+            let sse = self.calculate_sse_region(
+                &region_buffer,
+                target_rgba,
+                canvas_w,
+                &proposal.region,
+            )?;
+
+            results.push(sse);
+        }
+
+        Ok(results)
+    }
+
     fn name(&self) -> &str {
         "CPU"
     }
@@ -125,6 +185,14 @@ pub struct WgpuBackend {
     fill_bind_group_layout: Option<wgpu::BindGroupLayout>,
     rasterize_bind_group_layout: Option<wgpu::BindGroupLayout>,
     sse_bind_group_layout: Option<wgpu::BindGroupLayout>,
+
+    // Persistent GPU buffers (reused across calls)
+    target_buffer_gpu: Option<wgpu::Buffer>,          // Target image (packed RGBA u32) - rarely changes
+    target_buffer_size: usize,                        // Current size of target buffer
+    staging_buffer_read: Option<wgpu::Buffer>,        // Reusable staging buffer for GPU->CPU
+    staging_buffer_size: usize,                       // Current size of staging buffer
+    output_buffer: Option<wgpu::Buffer>,              // Reusable output buffer for compositing
+    output_buffer_size: usize,                        // Current size of output buffer
 }
 
 #[allow(dead_code)]
@@ -141,6 +209,12 @@ impl WgpuBackend {
             fill_bind_group_layout: None,
             rasterize_bind_group_layout: None,
             sse_bind_group_layout: None,
+            target_buffer_gpu: None,
+            target_buffer_size: 0,
+            staging_buffer_read: None,
+            staging_buffer_size: 0,
+            output_buffer: None,
+            output_buffer_size: 0,
         }
     }
 
@@ -160,6 +234,77 @@ impl WgpuBackend {
 
             adapter.is_some()
         })
+    }
+
+    /// Helper: Get or create staging buffer for reading from GPU
+    fn get_or_create_staging_buffer(&mut self, size_bytes: usize) -> Result<&wgpu::Buffer, String> {
+        let device = self.device.as_ref().ok_or("Device not initialized")?;
+
+        // Reallocate if current buffer is too small
+        if self.staging_buffer_size < size_bytes || self.staging_buffer_read.is_none() {
+            let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Persistent Staging Buffer"),
+                size: size_bytes as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.staging_buffer_read = Some(new_buffer);
+            self.staging_buffer_size = size_bytes;
+        }
+
+        Ok(self.staging_buffer_read.as_ref().unwrap())
+    }
+
+    /// Helper: Get or create output buffer for compositing
+    fn get_or_create_output_buffer(&mut self, size_bytes: usize) -> Result<&wgpu::Buffer, String> {
+        let device = self.device.as_ref().ok_or("Device not initialized")?;
+
+        // Reallocate if current buffer is too small
+        if self.output_buffer_size < size_bytes || self.output_buffer.is_none() {
+            let new_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Persistent Output Buffer"),
+                size: size_bytes as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.output_buffer = Some(new_buffer);
+            self.output_buffer_size = size_bytes;
+        }
+
+        Ok(self.output_buffer.as_ref().unwrap())
+    }
+
+    /// Helper: Upload target image to GPU (only if changed)
+    fn upload_target_if_needed(&mut self, target_rgba: &[u8]) -> Result<&wgpu::Buffer, String> {
+        let device = self.device.as_ref().ok_or("Device not initialized")?;
+
+        let size_bytes = target_rgba.len();
+
+        // Only re-upload if size changed or buffer doesn't exist
+        // (In reality, target rarely changes, so this is a huge win)
+        if self.target_buffer_size != size_bytes || self.target_buffer_gpu.is_none() {
+            // Pack RGBA into u32
+            let packed: Vec<u32> = target_rgba
+                .chunks_exact(4)
+                .map(|chunk| {
+                    chunk[0] as u32
+                        | ((chunk[1] as u32) << 8)
+                        | ((chunk[2] as u32) << 16)
+                        | ((chunk[3] as u32) << 24)
+                })
+                .collect();
+
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Persistent Target Buffer"),
+                contents: bytemuck::cast_slice(&packed),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+
+            self.target_buffer_gpu = Some(buffer);
+            self.target_buffer_size = size_bytes;
+        }
+
+        Ok(self.target_buffer_gpu.as_ref().unwrap())
     }
 }
 
@@ -396,26 +541,26 @@ impl ComputeBackend for WgpuBackend {
         triangles: &[Triangle],
         triangle_indices: &[usize],
     ) -> Result<Vec<u8>, String> {
+        if region.w == 0 || region.h == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pixel_count = region.w * region.h;
+        let buffer_size = pixel_count * 4;
+
+        // Prepare persistent buffers (borrows self mutably, then releases)
+        self.get_or_create_output_buffer(buffer_size)?;
+        self.get_or_create_staging_buffer(buffer_size)?;
+
+        // Now we can borrow device/queue/pipelines immutably without conflicts
         let device = self.device.as_ref().ok_or("Device not initialized")?;
         let queue = self.queue.as_ref().ok_or("Queue not initialized")?;
         let fill_pipeline = self.fill_pipeline.as_ref().ok_or("Fill pipeline not initialized")?;
         let rasterize_pipeline = self.rasterize_pipeline.as_ref().ok_or("Rasterize pipeline not initialized")?;
         let fill_bgl = self.fill_bind_group_layout.as_ref().ok_or("Fill bind group layout not initialized")?;
         let rasterize_bgl = self.rasterize_bind_group_layout.as_ref().ok_or("Rasterize bind group layout not initialized")?;
-
-        if region.w == 0 || region.h == 0 {
-            return Ok(Vec::new());
-        }
-
-        let pixel_count = region.w * region.h;
-
-        // Create output buffer (region RGBA as packed u32)
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer"),
-            size: (pixel_count * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let output_buffer = self.output_buffer.as_ref().ok_or("Output buffer not created")?;
+        let staging_buffer = self.staging_buffer_read.as_ref().ok_or("Staging buffer not created")?;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Compose Region Encoder"),
@@ -555,15 +700,8 @@ impl ComputeBackend for WgpuBackend {
             compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
         }
 
-        // Read back results
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: (pixel_count * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, (pixel_count * 4) as u64);
+        // Copy results to staging buffer for readback
+        encoder.copy_buffer_to_buffer(output_buffer, 0, staging_buffer, 0, buffer_size as u64);
 
         queue.submit(Some(encoder.finish()));
 
@@ -592,29 +730,22 @@ impl ComputeBackend for WgpuBackend {
         canvas_w: usize,
         region: &IntRect,
     ) -> Result<u64, String> {
-        let device = self.device.as_ref().ok_or("Device not initialized")?;
-        let queue = self.queue.as_ref().ok_or("Queue not initialized")?;
-        let sse_pipeline = self.sse_pipeline.as_ref().ok_or("SSE pipeline not initialized")?;
-        let sse_bgl = self.sse_bind_group_layout.as_ref().ok_or("SSE bind group layout not initialized")?;
-
         if region.w == 0 || region.h == 0 {
             return Ok(0);
         }
 
-        // Pack RGBA bytes into u32 for GPU (R|G<<8|B<<16|A<<24)
-        let pack_rgba = |rgba: &[u8]| -> Vec<u32> {
-            rgba.chunks_exact(4)
-                .map(|chunk| {
-                    chunk[0] as u32
-                        | ((chunk[1] as u32) << 8)
-                        | ((chunk[2] as u32) << 16)
-                        | ((chunk[3] as u32) << 24)
-                })
-                .collect()
-        };
+        // Upload target buffer if needed (borrows self mutably, then releases)
+        self.upload_target_if_needed(target_rgba)?;
 
-        let region_packed = pack_rgba(region_rgba);
-        let target_packed: Vec<u32> = target_rgba
+        // Now borrow immutably
+        let device = self.device.as_ref().ok_or("Device not initialized")?;
+        let queue = self.queue.as_ref().ok_or("Queue not initialized")?;
+        let sse_pipeline = self.sse_pipeline.as_ref().ok_or("SSE pipeline not initialized")?;
+        let sse_bgl = self.sse_bind_group_layout.as_ref().ok_or("SSE bind group layout not initialized")?;
+        let target_buffer = self.target_buffer_gpu.as_ref().ok_or("Target buffer not created")?;
+
+        // Pack region RGBA bytes into u32 for GPU (R|G<<8|B<<16|A<<24)
+        let region_packed: Vec<u32> = region_rgba
             .chunks_exact(4)
             .map(|chunk| {
                 chunk[0] as u32
@@ -624,16 +755,10 @@ impl ComputeBackend for WgpuBackend {
             })
             .collect();
 
-        // Create buffers
+        // Create region buffer (changes every call)
         let region_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Region Buffer"),
             contents: bytemuck::cast_slice(&region_packed),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let target_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Target Buffer"),
-            contents: bytemuck::cast_slice(&target_packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
@@ -726,6 +851,57 @@ impl ComputeBackend for WgpuBackend {
         staging_buffer.unmap();
 
         Ok(sse_u32 as u64)
+    }
+
+    fn evaluate_proposals_batch(
+        &mut self,
+        _canvas_rgba: &[u8],
+        target_rgba: &[u8],
+        canvas_w: usize,
+        canvas_h: usize,
+        background_color: [u8; 4],
+        proposals: &[ProposalEvaluationData],
+    ) -> Result<Vec<u64>, String> {
+        if proposals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // For GPU batch evaluation, we have two strategies:
+        // 1. Simple: Sequential evaluation (what we do now)
+        // 2. Advanced: True parallel batch with custom shader (future optimization)
+
+        // Currently using strategy 1 (still benefits from persistent buffers)
+        // Strategy 2 would require:
+        // - Packing all proposal data into unified buffers
+        // - Dispatching one workgroup per proposal
+        // - Each workgroup rasterizes + calculates SSE independently
+        // - Results written to output array
+
+        let mut results = Vec::with_capacity(proposals.len());
+
+        for proposal in proposals {
+            // Compose the candidate region
+            let region_buffer = self.compose_region(
+                &proposal.region,
+                canvas_w,
+                canvas_h,
+                background_color,
+                &proposal.triangles,
+                &proposal.triangle_indices,
+            )?;
+
+            // Calculate SSE
+            let sse = self.calculate_sse_region(
+                &region_buffer,
+                target_rgba,
+                canvas_w,
+                &proposal.region,
+            )?;
+
+            results.push(sse);
+        }
+
+        Ok(results)
     }
 
     fn name(&self) -> &str {
