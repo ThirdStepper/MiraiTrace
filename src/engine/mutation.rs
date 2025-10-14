@@ -310,7 +310,7 @@ pub(super) fn propose_mutation_with_bbox(
             }
         }
         MutationOperator::RemoveTriangle => {
-            // Remove a random triangle
+            // Smart removal: remove triangles that likely contribute least
             if current_dna.triangles.is_empty() || current_dna.triangles.len() < 10 {
                 // Don't remove if we have too few triangles - add instead
                 return propose_mutation_with_bbox(
@@ -325,8 +325,60 @@ pub(super) fn propose_mutation_with_bbox(
                 );
             }
 
+            // Strategy: Pick triangles that are likely redundant
+            // 1. Very low alpha (nearly transparent)
+            // 2. Very small area (tiny triangles)
+            // 3. In low-error regions (already well-covered)
+
+            let mut candidates = Vec::with_capacity(10);
+
+            // Collect up to 10 candidate triangles for removal
+            let sample_size = (current_dna.triangles.len() / 10).clamp(5, 20);
+            for _ in 0..sample_size {
+                let idx = rng.gen_range(0..current_dna.triangles.len());
+                let tri = &current_dna.triangles[idx];
+
+                // Calculate removal priority score (higher = more likely to remove)
+                let mut score = 0.0f32;
+
+                // Factor 1: Low alpha = likely not contributing much
+                let alpha_factor = 1.0 - (tri.a as f32 / 255.0);
+                score += alpha_factor * 2.0; // Weight: 2x
+
+                // Factor 2: Small area = less impact
+                let bbox = triangle_bbox_px(tri, canvas_w as usize, canvas_h as usize);
+                let area = (bbox.w * bbox.h) as f32;
+                let max_area = (canvas_w * canvas_h) as f32;
+                let area_factor = 1.0 - (area / max_area).min(1.0);
+                score += area_factor * 1.0; // Weight: 1x
+
+                // Factor 3: Check tile error - if tile has low error, triangle might be redundant
+                let tile_x = (bbox.x + bbox.w / 2) / tile_grid.tile_size;
+                let tile_y = (bbox.y + bbox.h / 2) / tile_grid.tile_size;
+                let tile_idx = tile_y.min(tile_grid.tiles_y - 1) * tile_grid.tiles_x + tile_x.min(tile_grid.tiles_x - 1);
+
+                if tile_idx < tile_grid.sse_per_tile.len() {
+                    let tile_error = tile_grid.sse_per_tile[tile_idx];
+                    // Lower tile error = already well-covered = safe to remove from
+                    let max_tile_error = tile_grid.sse_per_tile.iter().copied().max().unwrap_or(1);
+                    let error_factor = 1.0 - (tile_error as f32 / max_tile_error.max(1) as f32);
+                    score += error_factor * 1.5; // Weight: 1.5x
+                }
+
+                candidates.push((idx, score));
+            }
+
+            // Sort by score (highest score = best candidate for removal)
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Pick the best candidate (or random if no candidates)
+            let idx = if !candidates.is_empty() {
+                candidates[0].0
+            } else {
+                rng.gen_range(0..current_dna.triangles.len())
+            };
+
             let mut dna2 = current_dna.clone();
-            let idx = rng.gen_range(0..dna2.triangles.len());
             let removed = dna2.triangles.remove(idx);
             let bbox = triangle_bbox_px(&removed, canvas_w as usize, canvas_h as usize);
 
@@ -355,16 +407,30 @@ pub(super) fn propose_mutation_with_bbox(
             let idx = rng.gen_range(0..dna2.triangles.len());
             let before = dna2.triangles[idx].clone();
 
-            // Painterly: taper move jitter as the genome grows (12 → 3 px).
+            // Systematic directional search: try one of 8 compass directions
+            // This is much more efficient than random jitter!
             let tiles_total = tile_grid.tiles_x * tile_grid.tiles_y;
             let phase = growth_phase(dna2.triangles.len(), tiles_total, 8);
-            let jitter = move_vertex_jitter_for_phase(phase);
+            let step_size = move_vertex_jitter_for_phase(phase).max(1); // 1-12 pixels
 
-            // Move one vertex by a scheduled random delta
-            let which = rng.gen_range(0..3);
-            let dx = rng.gen_range(-jitter..=jitter);
-            let dy = rng.gen_range(-jitter..=jitter);
-            match which {
+            // Pick a random vertex and direction
+            let which_vertex = rng.gen_range(0..3);
+            let which_direction = rng.gen_range(0..8);
+
+            // 8 compass directions: N, NE, E, SE, S, SW, W, NW
+            let (dx, dy) = match which_direction {
+                0 => (0, -step_size),           // North (up)
+                1 => (step_size, -step_size),   // Northeast
+                2 => (step_size, 0),            // East (right)
+                3 => (step_size, step_size),    // Southeast
+                4 => (0, step_size),            // South (down)
+                5 => (-step_size, step_size),   // Southwest
+                6 => (-step_size, 0),           // West (left)
+                _ => (-step_size, -step_size),  // Northwest
+            };
+
+            // Apply movement to the selected vertex
+            match which_vertex {
                 0 => {
                     dna2.triangles[idx].x0 = clamp_i32(dna2.triangles[idx].x0 + dx, 0, canvas_w - 1);
                     dna2.triangles[idx].y0 = clamp_i32(dna2.triangles[idx].y0 + dy, 0, canvas_h - 1);
@@ -408,16 +474,58 @@ pub(super) fn propose_mutation_with_bbox(
             let mut dna2 = current_dna.clone();
             let idx = rng.gen_range(0..dna2.triangles.len());
 
-            // Small jitter to color and alpha — closure needs to be `mut` to borrow rng mutably.
-            let mut jitter = |c: u8, range: i32| -> u8 {
-                let n = c as i32 + rng.gen_range(-range..=range);
-                n.clamp(0, 255) as u8
-            };
-            let t = &mut dna2.triangles[idx];
-            t.r = jitter(t.r, 25);
-            t.g = jitter(t.g, 25);
-            t.b = jitter(t.b, 25);
-            t.a = jitter(t.a, 20);
+            // Target-based recolor: Sample actual colors from target image under the triangle
+            let tri = &dna2.triangles[idx];
+            let bbox = triangle_bbox_px(tri, canvas_w as usize, canvas_h as usize);
+
+            // Sample random pixels within the triangle's bounding box
+            let mut acc_r: u64 = 0;
+            let mut acc_g: u64 = 0;
+            let mut acc_b: u64 = 0;
+            let mut sample_count = 0u32;
+
+            let samples = 32.min((bbox.w * bbox.h).max(1));
+            for _ in 0..samples {
+                let x = rng.gen_range(bbox.x..bbox.x + bbox.w).min(canvas_w as usize - 1);
+                let y = rng.gen_range(bbox.y..bbox.y + bbox.h).min(canvas_h as usize - 1);
+                let i = (y * canvas_w as usize + x) * 4;
+
+                acc_r += target_rgba[i] as u64;
+                acc_g += target_rgba[i + 1] as u64;
+                acc_b += target_rgba[i + 2] as u64;
+                sample_count += 1;
+            }
+
+            if sample_count > 0 {
+                // Calculate ideal color from target
+                let ideal_r = (acc_r / sample_count as u64) as u8;
+                let ideal_g = (acc_g / sample_count as u64) as u8;
+                let ideal_b = (acc_b / sample_count as u64) as u8;
+
+                // Interpolate between current and ideal color
+                // Use random interpolation factor to create variety
+                let interp = rng.gen_range(0.5..1.0); // 50-100% toward ideal
+
+                let t = &mut dna2.triangles[idx];
+                t.r = lerp(t.r as f32, ideal_r as f32, interp) as u8;
+                t.g = lerp(t.g as f32, ideal_g as f32, interp) as u8;
+                t.b = lerp(t.b as f32, ideal_b as f32, interp) as u8;
+
+                // Add small jitter to alpha for variety
+                let alpha_jitter = rng.gen_range(-15..=15);
+                t.a = (t.a as i32 + alpha_jitter).clamp(30, 220) as u8;
+            } else {
+                // Fallback: small random jitter if sampling fails
+                let mut jitter = |c: u8, range: i32| -> u8 {
+                    let n = c as i32 + rng.gen_range(-range..=range);
+                    n.clamp(0, 255) as u8
+                };
+                let t = &mut dna2.triangles[idx];
+                t.r = jitter(t.r, 25);
+                t.g = jitter(t.g, 25);
+                t.b = jitter(t.b, 25);
+                t.a = jitter(t.a, 20);
+            }
 
             let bbox = triangle_bbox_px(&dna2.triangles[idx], canvas_w as usize, canvas_h as usize);
             Proposal {
