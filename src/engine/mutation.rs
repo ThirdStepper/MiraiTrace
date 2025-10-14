@@ -97,22 +97,6 @@ pub(super) struct Proposal {
 }
 
 // ---------- Local helpers used by proposer ----------
-#[allow(dead_code)]
-fn random_triangle(rng: &mut PcgRng, canvas_w: usize, canvas_h: usize) -> Triangle {
-    let x0 = rng.gen_range(0..canvas_w as i32);
-    let y0 = rng.gen_range(0..canvas_h as i32);
-    let x1 = clamp_i32(x0 + rng.gen_range(-20..=20), 0, canvas_w as i32 - 1);
-    let y1 = clamp_i32(y0 + rng.gen_range(-20..=20), 0, canvas_h as i32 - 1);
-    let x2 = clamp_i32(x0 + rng.gen_range(-20..=20), 0, canvas_w as i32 - 1);
-    let y2 = clamp_i32(y0 + rng.gen_range(-20..=20), 0, canvas_h as i32 - 1);
-
-    let r = rng.gen_range(0..=255);
-    let g = rng.gen_range(0..=255);
-    let b = rng.gen_range(0..=255);
-    let a = rng.gen_range(10..=200);
-
-    Triangle { x0, y0, x1, y1, x2, y2, r, g, b, a }
-}
 
 /// Pick a tile with probability proportional to its current SSE (higher error → more likely).
 fn pick_error_weighted_tile(tile_grid: &TileGrid, rng: &mut PcgRng) -> (usize, usize) {

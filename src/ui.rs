@@ -23,15 +23,6 @@ use std::path::Path;
 
 use crate::engine::{EvolutionEngine, EvolutionStats, ComputeBackendType};
 
-/// How much HUD to show.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum HudDensity {
-    Auto,    // decide from window width
-    Compact, // minimal fields
-    Full,    // all fields
-}
-
 /// Main egui app.
 pub struct MiraiTrace {
     // Core engine
@@ -50,8 +41,6 @@ pub struct MiraiTrace {
     show_canvas_only: bool,
 
     // HUD options
-    hud_density: HudDensity,
-    show_mini_plot: bool,
     show_stats_window: bool,  // Toggle for floating stats window
 
     // Canvas clear color (UI model). Changing it clears/rebaselines the engine.
@@ -85,8 +74,6 @@ impl MiraiTrace {
             original_width: 0,
             original_height: 0,
             show_canvas_only: false,
-            hud_density: HudDensity::Auto,
-            show_mini_plot: true,
             show_stats_window: true,  // Show stats by default
             canvas_clear_color: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255), // default white
         }
@@ -369,121 +356,6 @@ impl MiraiTrace {
         });
     }
 
-    /// Bottom bar with a compact, stable HUD (fixed-width monospace columns to avoid jitter).
-    #[allow(dead_code)]
-    fn bottom_hud(&mut self, ui: &mut egui::Ui) {
-        let stats: EvolutionStats = self.engine.capture_stats_snapshot();
-
-        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-
-        // Decide how much to show if Auto mode is selected.
-        let use_compact = match self.hud_density {
-            HudDensity::Compact => true,
-            HudDensity::Full => false,
-            HudDensity::Auto => ui.available_width() < 900.0, // crude but effective
-        };
-
-        // Stable, fixed-width readout so the bar never jumps around.
-        let op = stats.last_operator_label.as_deref().unwrap_or("-");
-
-        let (w_add, w_remove, w_move, w_recolor) = {
-            let mut add = 0.0;
-            let mut rem = 0.0;
-            let mut mv = 0.0;
-            let mut rc = 0.0;
-            for (label, w) in &stats.operator_weights {
-                match label.as_str() {
-                    "Add" => add = *w,
-                    "Remove" => rem = *w,
-                    "Move" => mv = *w,
-                    "Recolor" => rc = *w,
-                    _ => {}
-                }
-            }
-            (add, rem, mv, rc)
-        };
-
-        let accept_pct = stats.recent_acceptance_percent;
-        let accept_win = stats.recent_window_size;
-
-        let curr_err = stats.current_error.unwrap_or(0);
-        let best_err = stats.best_error.unwrap_or(0);
-        let delta = stats.last_accept_delta.unwrap_or(0);
-
-        let tri = stats.triangle_count;
-        let gen = stats.generation_counter;
-
-        let pps = stats.proposals_per_second;
-        let aps = stats.accepts_per_second;
-
-        if use_compact {
-            ui.label(format!(
-                "op:{:<7} | acc:{:>5.1}% | err:{:>12} best:{:>12} | tris:{:>6} gen:{:>8} | Props/s:{:>6.1} Accepts/s:{:>6.1}",
-                op, accept_pct, curr_err, best_err, tri, gen, pps, aps
-            ));
-        } else {
-            ui.label(format!(
-                "op:{:<7} | wA:{:>4.2} wRm:{:>4.2} wM:{:>4.2} wRc:{:>4.2} | acc:{:>5.1}% (win {}) | err:{:>12} best:{:>12} Δ:{:>8} | tris:{:>6} gen:{:>8} | Props/s:{:>6.1} Accepts/s:{:>6.1} ",
-                op, w_add, w_remove, w_move, w_recolor, accept_pct, accept_win, curr_err, best_err, delta, tri, gen, pps, aps,
-            ));
-        }
-
-        if let Some(t) = stats.anneal_temp {
-            ui.label(format!("Anneal temp: {:.3}", t));
-        }
-
-        ui.label(format!(
-            "Uphill acc: {:.1}% ({} / {})",
-            stats.recent_uphill_acceptance_percent,
-            stats.total_uphill_accepts,     // lifetime accepted uphill
-            stats.total_uphill_attempts     // lifetime uphill attempts
-        ))
-        .on_hover_text("Acceptance of uphill (worsening) moves — windowed % reflects the last ~0.5s.");
-
-        // Optional tiny sparkline for best-error history (toggleable).
-        if self.show_mini_plot {
-            // Reserve a small fixed-height area and draw a sparkline with the painter.
-            let plot_height = 40.0;
-            let plot_response = ui.allocate_response(
-                egui::vec2(ui.available_width(), plot_height),
-                egui::Sense::hover(),
-            );
-            let rect = plot_response.rect;
-            let painter = ui.painter_at(rect);
-
-            // Extract series; if empty or all equal, draw a faint baseline.
-            let series = &stats.error_history;
-            if !series.is_empty() {
-                let min_v = *series.iter().min().unwrap();
-                let max_v = *series.iter().max().unwrap();
-                let span = (max_v.saturating_sub(min_v)).max(1);
-
-                // Map each point into the rect and draw line segments.
-                let n = series.len();
-                for i in 1..n {
-                    let x0 = rect.left() + (i as f32 - 1.0) / (n - 1) as f32 * rect.width();
-                    let x1 = rect.left() + (i as f32) / (n - 1) as f32 * rect.width();
-
-                    // Lower error = higher line (invert y)
-                    let y0 = rect.bottom()
-                        - ((series[i - 1] - min_v) as f32 / span as f32) * rect.height();
-                    let y1 = rect.bottom()
-                        - ((series[i] - min_v) as f32 / span as f32) * rect.height();
-
-                    painter.line_segment(
-                        [egui::pos2(x0, y0), egui::pos2(x1, y1)],
-                        egui::Stroke::new(1.0, ui.visuals().text_color()),
-                    );
-                }
-            } else {
-                // Faint baseline when nothing to show yet.
-                painter.line_segment(
-                    [egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)],
-                    egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
-                );
-            }
-        }
-    }
 }
 
 impl eframe::App for MiraiTrace {
