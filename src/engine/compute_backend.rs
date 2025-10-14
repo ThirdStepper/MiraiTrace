@@ -6,6 +6,17 @@
 use super::{IntRect, Triangle};
 use wgpu::util::DeviceExt;
 
+/// Data for evaluating a single proposal on the GPU
+#[derive(Clone, Debug)]
+pub struct ProposalEvaluationData {
+    /// The region affected by this proposal
+    pub region: IntRect,
+    /// All triangles in the candidate DNA
+    pub triangles: Vec<Triangle>,
+    /// Indices specifying draw order
+    pub triangle_indices: Vec<usize>,
+}
+
 /// Compute backend trait - defines the interface for CPU/GPU implementations
 #[allow(dead_code)]
 pub trait ComputeBackend: Send + Sync {
@@ -32,6 +43,18 @@ pub trait ComputeBackend: Send + Sync {
         canvas_w: usize,
         region: &IntRect,
     ) -> Result<u64, String>;
+
+    /// Evaluate multiple proposals in a single batch (GPU-optimized)
+    /// Returns SSE for each proposal in the same order as input
+    fn evaluate_proposals_batch(
+        &mut self,
+        canvas_rgba: &[u8],
+        target_rgba: &[u8],
+        canvas_w: usize,
+        canvas_h: usize,
+        background_color: [u8; 4],
+        proposals: &[ProposalEvaluationData],
+    ) -> Result<Vec<u64>, String>;
 
     /// Get backend name for display
     fn name(&self) -> &str;
@@ -97,6 +120,43 @@ impl ComputeBackend for CpuBackend {
         Ok(total_squared_error_rgb_region_from_buffer_vs_target(
             region_rgba, target_rgba, canvas_w, region
         ))
+    }
+
+    fn evaluate_proposals_batch(
+        &mut self,
+        _canvas_rgba: &[u8],
+        target_rgba: &[u8],
+        canvas_w: usize,
+        canvas_h: usize,
+        background_color: [u8; 4],
+        proposals: &[ProposalEvaluationData],
+    ) -> Result<Vec<u64>, String> {
+        // CPU implementation: just loop through proposals sequentially
+        let mut results = Vec::with_capacity(proposals.len());
+
+        for proposal in proposals {
+            // Compose the candidate region
+            let region_buffer = self.compose_region(
+                &proposal.region,
+                canvas_w,
+                canvas_h,
+                background_color,
+                &proposal.triangles,
+                &proposal.triangle_indices,
+            )?;
+
+            // Calculate SSE
+            let sse = self.calculate_sse_region(
+                &region_buffer,
+                target_rgba,
+                canvas_w,
+                &proposal.region,
+            )?;
+
+            results.push(sse);
+        }
+
+        Ok(results)
     }
 
     fn name(&self) -> &str {
@@ -791,6 +851,57 @@ impl ComputeBackend for WgpuBackend {
         staging_buffer.unmap();
 
         Ok(sse_u32 as u64)
+    }
+
+    fn evaluate_proposals_batch(
+        &mut self,
+        _canvas_rgba: &[u8],
+        target_rgba: &[u8],
+        canvas_w: usize,
+        canvas_h: usize,
+        background_color: [u8; 4],
+        proposals: &[ProposalEvaluationData],
+    ) -> Result<Vec<u64>, String> {
+        if proposals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // For GPU batch evaluation, we have two strategies:
+        // 1. Simple: Sequential evaluation (what we do now)
+        // 2. Advanced: True parallel batch with custom shader (future optimization)
+
+        // Currently using strategy 1 (still benefits from persistent buffers)
+        // Strategy 2 would require:
+        // - Packing all proposal data into unified buffers
+        // - Dispatching one workgroup per proposal
+        // - Each workgroup rasterizes + calculates SSE independently
+        // - Results written to output array
+
+        let mut results = Vec::with_capacity(proposals.len());
+
+        for proposal in proposals {
+            // Compose the candidate region
+            let region_buffer = self.compose_region(
+                &proposal.region,
+                canvas_w,
+                canvas_h,
+                background_color,
+                &proposal.triangles,
+                &proposal.triangle_indices,
+            )?;
+
+            // Calculate SSE
+            let sse = self.calculate_sse_region(
+                &region_buffer,
+                target_rgba,
+                canvas_w,
+                &proposal.region,
+            )?;
+
+            results.push(sse);
+        }
+
+        Ok(results)
     }
 
     fn name(&self) -> &str {

@@ -36,6 +36,7 @@ use super::{
 };
 use super::mutation::propose_mutation_with_bbox;
 use super::EvolutionStats;
+use super::compute_backend::{ComputeBackend, CpuBackend, WgpuBackend, ProposalEvaluationData};
 
 pub use crate::engine::ComputeBackendType;
 
@@ -150,6 +151,30 @@ impl EvolutionEngine {
             let mut scheduler = AdaptiveMutationScheduler::new();
             let mut sa = SimAnneal::new();
 
+            // Initialize compute backend based on user selection
+            let mut backend: Box<dyn ComputeBackend> = {
+                let s = shared_mutex.lock();
+                let (backend_type, w, h) = (s.compute_backend, s.width, s.height);
+                drop(s); // Release lock before potentially slow GPU init
+
+                match backend_type {
+                    ComputeBackendType::Cpu => Box::new(CpuBackend::new()),
+                    ComputeBackendType::Wgpu => {
+                        let mut gpu_backend = WgpuBackend::new();
+                        if let Err(e) = gpu_backend.initialize(w, h) {
+                            eprintln!("Failed to initialize WGPU backend: {}, falling back to CPU", e);
+                            Box::new(CpuBackend::new())
+                        } else {
+                            Box::new(gpu_backend)
+                        }
+                    }
+                }
+            };
+
+            // Track canvas dimensions to detect when we need to reinitialize backend
+            let mut last_canvas_w = 0;
+            let mut last_canvas_h = 0;
+
             // Reused scratch buffer for composing candidate regions
             let mut scratch_region: Vec<u8> = Vec::new();
 
@@ -166,6 +191,27 @@ impl EvolutionEngine {
                 };
                 if target_opt.is_none() { thread::sleep(Duration::from_millis(10)); continue; }
                 let target_rgba = target_opt.unwrap();
+
+                // Re-initialize backend if canvas size changed
+                if canvas_w != last_canvas_w || canvas_h != last_canvas_h {
+                    last_canvas_w = canvas_w;
+                    last_canvas_h = canvas_h;
+
+                    // Reinitialize backend with new dimensions
+                    let backend_type = { let s = shared_mutex.lock(); s.compute_backend };
+                    backend = match backend_type {
+                        ComputeBackendType::Cpu => Box::new(CpuBackend::new()),
+                        ComputeBackendType::Wgpu => {
+                            let mut gpu_backend = WgpuBackend::new();
+                            if let Err(e) = gpu_backend.initialize(canvas_w, canvas_h) {
+                                eprintln!("Failed to reinitialize WGPU backend after resize: {}, falling back to CPU", e);
+                                Box::new(CpuBackend::new())
+                            } else {
+                                Box::new(gpu_backend)
+                            }
+                        }
+                    };
+                }
 
                 // -----------------------------------------------------------------
                 // Build baseline once (blank canvas vs target) and sync tile grid
@@ -264,8 +310,7 @@ impl EvolutionEngine {
                         10  // Smaller batches during refinement
                     };
 
-                    // PARALLEL BATCH SAMPLING: Evaluate N candidates in parallel, keep the best
-                    // Generate all proposals first (sequential with shared RNG)
+                    // BATCH SAMPLING: Generate all proposals first (sequential with shared RNG)
                     let mut proposals = Vec::with_capacity(batch_size);
                     for _ in 0..batch_size {
                         proposals.push(propose_mutation_with_bbox(
@@ -276,73 +321,112 @@ impl EvolutionEngine {
                         ));
                     }
 
-                    // Get canvas snapshot for parallel evaluation
+                    // Get canvas snapshot for batch evaluation
                     let canvas_snapshot = {
                         let s = shared_mutex.lock();
                         s.pixel_backbuffer_rgba.clone()
                     };
 
-                    // Evaluate all candidates IN PARALLEL
-                    let evaluated_candidates: Vec<_> = proposals
-                        .into_par_iter()
-                        .filter_map(|proposal| {
-                            // Each thread gets its own scratch buffer and index snapshot
-                            let mut index_snapshot_local = index_snapshot.clone();
-                            let mut scratch_region_local = Vec::new();
-
-                            // Geometry-true affected rect
-                            let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
+                    // GPU BATCH EVALUATION: Convert proposals to GPU format and evaluate in a single batch
+                    let gpu_proposals: Vec<ProposalEvaluationData> = proposals
+                        .iter()
+                        .filter_map(|p| {
+                            let union_rect = pad_and_clamp_rect(p.affected_bbox_px, 2, canvas_w, canvas_h);
                             if union_rect.w == 0 || union_rect.h == 0 { return None; }
 
-                            // Pick tiles
-                            let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
-                            let tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
-                            if tiles_touched.is_empty() { return None; }
-
-                            // Compose candidate buffer
-                            scratch_region_local.resize(union_rect.w * union_rect.h * 4, 0);
-                            fill_region_rgba_solid(&mut scratch_region_local, &union_rect, bg_rgba);
-                            compose_candidate_region_with_culled_subset(
-                                &mut scratch_region_local, &union_rect, canvas_w, canvas_h,
-                                &dna_snapshot, &mut index_snapshot_local,
-                                proposal.changed_index, &proposal.candidate_dna_out,
-                            );
-
-                            // Current error over EXACT rect (no lock needed - using snapshot)
-                            let current_error_in_rect = total_squared_error_rgb_region_from_canvas_vs_target(
-                                &canvas_snapshot, &target_rgba, canvas_w, &union_rect);
-
-                            // Fast candidate estimate
-                            let candidate_error_in_rect = total_sse_region_with_cutoff(
-                                &scratch_region_local, &target_rgba, canvas_w, &union_rect, current_error_in_rect);
-
-                            // Calculate total error for this candidate
-                            let candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
-                                Some(rest) => rest + candidate_error_in_rect,
-                                None => {
-                                    let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
-                                    base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
-                                }
-                            };
-
-                            Some((candidate_total_error, proposal, union_rect, tiles_touched, scratch_region_local))
+                            Some(ProposalEvaluationData {
+                                region: union_rect,
+                                triangles: p.candidate_dna_out.triangles.clone(),
+                                triangle_indices: (0..p.candidate_dna_out.triangles.len()).collect(),
+                            })
                         })
                         .collect();
 
-                    // Find the best candidate sequentially
-                    let best = evaluated_candidates.into_iter()
-                        .min_by_key(|(error, _, _, _, _)| *error);
+                    // Early exit if no valid proposals
+                    if gpu_proposals.is_empty() {
+                        sa.note_no_improvement();
+                        continue;
+                    }
 
-                    // Unwrap the best candidate (already checked for None above)
-                    let (_, proposal, union_rect, tiles_touched, scratch_region_best) = match best {
-                        Some(b) => b,
+                    // Call GPU batch evaluation (or CPU fallback)
+                    let region_sse_results = backend.evaluate_proposals_batch(
+                        &canvas_snapshot,
+                        &target_rgba,
+                        canvas_w,
+                        canvas_h,
+                        bg_rgba,
+                        &gpu_proposals,
+                    );
+
+                    // Handle GPU errors by falling back to CPU
+                    let region_sse_results = match region_sse_results {
+                        Ok(results) => results,
+                        Err(e) => {
+                            eprintln!("GPU batch evaluation failed: {}, falling back to CPU", e);
+                            // Evaluate using parallel CPU path as fallback
+                            proposals
+                                .par_iter()
+                                .filter_map(|proposal| {
+                                    let mut index_snapshot_local = index_snapshot.clone();
+                                    let mut scratch_region_local = Vec::new();
+
+                                    let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
+                                    if union_rect.w == 0 || union_rect.h == 0 { return None; }
+
+                                    let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
+                                    let tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
+                                    if tiles_touched.is_empty() { return None; }
+
+                                    scratch_region_local.resize(union_rect.w * union_rect.h * 4, 0);
+                                    fill_region_rgba_solid(&mut scratch_region_local, &union_rect, bg_rgba);
+                                    compose_candidate_region_with_culled_subset(
+                                        &mut scratch_region_local, &union_rect, canvas_w, canvas_h,
+                                        &dna_snapshot, &mut index_snapshot_local,
+                                        proposal.changed_index, &proposal.candidate_dna_out,
+                                    );
+
+                                    let current_error_in_rect = total_squared_error_rgb_region_from_canvas_vs_target(
+                                        &canvas_snapshot, &target_rgba, canvas_w, &union_rect);
+
+                                    let candidate_error_in_rect = total_sse_region_with_cutoff(
+                                        &scratch_region_local, &target_rgba, canvas_w, &union_rect, current_error_in_rect);
+
+                                    Some(candidate_error_in_rect)
+                                })
+                                .collect()
+                        }
+                    };
+
+                    // Find the best candidate based on region SSE
+                    let best_idx = region_sse_results.iter()
+                        .enumerate()
+                        .min_by_key(|(_, &sse)| sse)
+                        .map(|(idx, _)| idx);
+
+                    let best_idx = match best_idx {
+                        Some(idx) => idx,
                         None => {
                             sa.note_no_improvement();
                             continue;
                         }
                     };
 
-                    scratch_region = scratch_region_best;
+                    // Extract the winning proposal
+                    let proposal = &proposals[best_idx];
+                    let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
+                    let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
+                    let tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
+
+                    // Re-render the best candidate to get the scratch_region buffer
+                    // (GPU evaluation doesn't return the actual pixels, only SSE)
+                    scratch_region.resize(union_rect.w * union_rect.h * 4, 0);
+                    fill_region_rgba_solid(&mut scratch_region, &union_rect, bg_rgba);
+                    let mut index_snapshot_local = index_snapshot.clone();
+                    compose_candidate_region_with_culled_subset(
+                        &mut scratch_region, &union_rect, canvas_w, canvas_h,
+                        &dna_snapshot, &mut index_snapshot_local,
+                        proposal.changed_index, &proposal.candidate_dna_out,
+                    );
 
                     // Final exact recompute (no cutoff) before acceptance decision
                     let exact_current_in_rect = {
