@@ -151,11 +151,11 @@ impl EvolutionEngine {
             let mut scheduler = AdaptiveMutationScheduler::new();
             let mut sa = SimAnneal::new();
 
-            // Initialize compute backend
+            // Initialize compute backend based on user selection
             let mut backend: Box<dyn ComputeBackend> = {
                 let s = shared_mutex.lock();
                 let (backend_type, w, h) = (s.compute_backend, s.width, s.height);
-                drop(s);
+                drop(s); // Release lock before potentially slow GPU init
 
                 match backend_type {
                     ComputeBackendType::Cpu => Box::new(CpuBackend::new()),
@@ -171,10 +171,12 @@ impl EvolutionEngine {
                 }
             };
 
-            // Track backend type and canvas size for change detection
-            let mut last_backend_type = { let s = shared_mutex.lock(); s.compute_backend };
+            // Track canvas dimensions and backend type to detect when we need to reinitialize
             let mut last_canvas_w = 0;
             let mut last_canvas_h = 0;
+            let mut last_backend_type = { let s = shared_mutex.lock(); s.compute_backend };
+
+            // Track actual backend name for stats display
             let mut actual_backend_name = String::from("CPU");
 
             // Reused scratch buffer for composing candidate regions
@@ -194,13 +196,14 @@ impl EvolutionEngine {
                 if target_opt.is_none() { thread::sleep(Duration::from_millis(10)); continue; }
                 let target_rgba = target_opt.unwrap();
 
-                // Re-initialize backend if type or canvas size changed
+                // Re-initialize backend if canvas size or backend type changed
                 let current_backend_type = { let s = shared_mutex.lock(); s.compute_backend };
-                if current_backend_type != last_backend_type || canvas_w != last_canvas_w || canvas_h != last_canvas_h {
-                    last_backend_type = current_backend_type;
+                if canvas_w != last_canvas_w || canvas_h != last_canvas_h || current_backend_type != last_backend_type {
                     last_canvas_w = canvas_w;
                     last_canvas_h = canvas_h;
+                    last_backend_type = current_backend_type;
 
+                    // Reinitialize backend with new dimensions or type
                     backend = match current_backend_type {
                         ComputeBackendType::Cpu => {
                             actual_backend_name = String::from("CPU");
@@ -328,8 +331,7 @@ impl EvolutionEngine {
                         10  // Smaller batches during refinement
                     };
 
-                    // PARALLEL BATCH SAMPLING: Evaluate N candidates in parallel, keep the best
-                    // Generate all proposals first (sequential with shared RNG)
+                    // BATCH SAMPLING: Generate all proposals first (sequential with shared RNG)
                     let mut proposals = Vec::with_capacity(batch_size);
                     for _ in 0..batch_size {
                         proposals.push(propose_mutation_with_bbox(
@@ -340,13 +342,13 @@ impl EvolutionEngine {
                         ));
                     }
 
-                    // Get canvas snapshot for evaluation
+                    // Get canvas snapshot for batch evaluation
                     let canvas_snapshot = {
                         let s = shared_mutex.lock();
                         s.pixel_backbuffer_rgba.clone()
                     };
 
-                    // GPU BATCH EVALUATION: Convert proposals to GPU format
+                    // GPU BATCH EVALUATION: Convert proposals to GPU format and evaluate in a single batch
                     let gpu_proposals: Vec<ProposalEvaluationData> = proposals
                         .iter()
                         .filter_map(|p| {
@@ -454,26 +456,6 @@ impl EvolutionEngine {
                         proposal.changed_index, &proposal.candidate_dna_out,
                     );
 
-                    // Recalculate final exact errors for the winner
-                    let current_error_in_rect = {
-                        let s = shared_mutex.lock();
-                        total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
-                    };
-
-                    let candidate_error_in_rect = total_squared_error_rgb_region_from_buffer_vs_target(
-                        &scratch_region, &target_rgba, canvas_w, &union_rect);
-
-                    let mut candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
-                        Some(rest) => rest + candidate_error_in_rect,
-                        None => {
-                            let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
-                            base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
-                        }
-                    };
-
-                    // Batch sampling already handled finding the best candidate
-                    // No need for separate Best-of-K recolor logic
-
                     // Final exact recompute (no cutoff) before acceptance decision
                     let exact_current_in_rect = {
                         let s = shared_mutex.lock();
@@ -482,8 +464,8 @@ impl EvolutionEngine {
 
                     let exact_candidate_in_rect = total_squared_error_rgb_region_from_buffer_vs_target(
                         &scratch_region, &target_rgba, canvas_w, &union_rect);
-                        
-                    candidate_total_error = match current_total_error.checked_sub(exact_current_in_rect) {
+
+                    let candidate_total_error = match current_total_error.checked_sub(exact_current_in_rect) {
                         Some(rest) => rest + exact_candidate_in_rect,
                         None => {
                             let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);

@@ -38,7 +38,7 @@ pub struct EvolutionStats {
     pub total_uphill_accepts: u64,             // lifetime uphill accepts
 
     // Active compute backend
-    pub active_backend: String,                // "CPU" or "WGPU GPU" or "CPU (GPU error fallback)"
+    pub active_backend: String,                // "CPU" or "WGPU GPU" or "WGPU GPU (fallback to CPU)"
 }
 
 impl EvolutionStats {

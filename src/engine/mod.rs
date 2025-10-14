@@ -35,14 +35,7 @@ impl ComputeBackendType {
                 compute_backend::WgpuBackend::is_available()
             }
         }
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            ComputeBackendType::Cpu => "CPU",
-            ComputeBackendType::Wgpu => "WGPU GPU",
-        }
-    }
+    }    
 }
 
 
