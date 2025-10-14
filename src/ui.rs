@@ -23,15 +23,6 @@ use std::path::Path;
 
 use crate::engine::{EvolutionEngine, EvolutionStats, ComputeBackendType};
 
-/// How much HUD to show.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum HudDensity {
-    Auto,    // decide from window width
-    Compact, // minimal fields
-    Full,    // all fields
-}
-
 /// Main egui app.
 pub struct MiraiTrace {
     // Core engine
