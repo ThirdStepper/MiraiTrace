@@ -369,6 +369,7 @@ impl MiraiTrace {
     }
 
     /// Bottom bar with a compact, stable HUD (fixed-width monospace columns to avoid jitter).
+    #[allow(dead_code)]
     fn bottom_hud(&mut self, ui: &mut egui::Ui) {
         let stats: EvolutionStats = self.engine.capture_stats_snapshot();
 

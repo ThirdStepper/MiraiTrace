@@ -233,7 +233,7 @@ impl EvolutionEngine {
 
                 for _ in 0..proposals_this_tick {
                     // Snapshot live state needed to score a proposal
-                    let (total_err_opt, dna_snapshot, max_tris_cap, grid_snapshot, mut index_snapshot) = {
+                    let (total_err_opt, dna_snapshot, max_tris_cap, grid_snapshot, index_snapshot) = {
                         let s = shared_mutex.lock();
                         let ts = choose_tile_size(s.width, s.height);
                         (
@@ -334,7 +334,7 @@ impl EvolutionEngine {
                         .min_by_key(|(error, _, _, _, _)| *error);
 
                     // Unwrap the best candidate (already checked for None above)
-                    let (_, mut proposal, mut union_rect, mut tiles_touched, mut scratch_region_best) = match best {
+                    let (_, proposal, union_rect, tiles_touched, scratch_region_best) = match best {
                         Some(b) => b,
                         None => {
                             sa.note_no_improvement();
@@ -344,26 +344,6 @@ impl EvolutionEngine {
 
                     scratch_region = scratch_region_best;
 
-                    // Recalculate final exact errors for the winner
-                    let mut current_error_in_rect = {
-                        let s = shared_mutex.lock();
-                        total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
-                    };
-
-                    let mut candidate_error_in_rect = total_squared_error_rgb_region_from_buffer_vs_target(
-                        &scratch_region, &target_rgba, canvas_w, &union_rect);
-
-                    let mut candidate_total_error = match current_total_error.checked_sub(current_error_in_rect) {
-                        Some(rest) => rest + candidate_error_in_rect,
-                        None => {
-                            let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
-                            base.saturating_sub(current_error_in_rect) + candidate_error_in_rect
-                        }
-                    };
-
-                    // Batch sampling already handled finding the best candidate
-                    // No need for separate Best-of-K recolor logic
-
                     // Final exact recompute (no cutoff) before acceptance decision
                     let exact_current_in_rect = {
                         let s = shared_mutex.lock();
@@ -372,8 +352,8 @@ impl EvolutionEngine {
 
                     let exact_candidate_in_rect = total_squared_error_rgb_region_from_buffer_vs_target(
                         &scratch_region, &target_rgba, canvas_w, &union_rect);
-                        
-                    candidate_total_error = match current_total_error.checked_sub(exact_current_in_rect) {
+
+                    let candidate_total_error = match current_total_error.checked_sub(exact_current_in_rect) {
                         Some(rest) => rest + exact_candidate_in_rect,
                         None => {
                             let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
