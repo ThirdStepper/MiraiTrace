@@ -171,9 +171,13 @@ impl EvolutionEngine {
                 }
             };
 
-            // Track canvas dimensions to detect when we need to reinitialize backend
+            // Track canvas dimensions and backend type to detect when we need to reinitialize
             let mut last_canvas_w = 0;
             let mut last_canvas_h = 0;
+            let mut last_backend_type = { let s = shared_mutex.lock(); s.compute_backend };
+
+            // Track actual backend name for stats display
+            let mut actual_backend_name = String::from("CPU");
 
             // Reused scratch buffer for composing candidate regions
             let mut scratch_region: Vec<u8> = Vec::new();
@@ -192,25 +196,37 @@ impl EvolutionEngine {
                 if target_opt.is_none() { thread::sleep(Duration::from_millis(10)); continue; }
                 let target_rgba = target_opt.unwrap();
 
-                // Re-initialize backend if canvas size changed
-                if canvas_w != last_canvas_w || canvas_h != last_canvas_h {
+                // Re-initialize backend if canvas size or backend type changed
+                let current_backend_type = { let s = shared_mutex.lock(); s.compute_backend };
+                if canvas_w != last_canvas_w || canvas_h != last_canvas_h || current_backend_type != last_backend_type {
                     last_canvas_w = canvas_w;
                     last_canvas_h = canvas_h;
+                    last_backend_type = current_backend_type;
 
-                    // Reinitialize backend with new dimensions
-                    let backend_type = { let s = shared_mutex.lock(); s.compute_backend };
-                    backend = match backend_type {
-                        ComputeBackendType::Cpu => Box::new(CpuBackend::new()),
+                    // Reinitialize backend with new dimensions or type
+                    backend = match current_backend_type {
+                        ComputeBackendType::Cpu => {
+                            actual_backend_name = String::from("CPU");
+                            Box::new(CpuBackend::new())
+                        },
                         ComputeBackendType::Wgpu => {
                             let mut gpu_backend = WgpuBackend::new();
                             if let Err(e) = gpu_backend.initialize(canvas_w, canvas_h) {
-                                eprintln!("Failed to reinitialize WGPU backend after resize: {}, falling back to CPU", e);
+                                eprintln!("Failed to initialize WGPU backend: {}, falling back to CPU", e);
+                                actual_backend_name = String::from("CPU (WGPU init failed)");
                                 Box::new(CpuBackend::new())
                             } else {
+                                actual_backend_name = String::from("WGPU GPU");
                                 Box::new(gpu_backend)
                             }
                         }
                     };
+
+                    // Update stats with actual backend
+                    {
+                        let mut s = shared_mutex.lock();
+                        s.stats.active_backend = actual_backend_name.clone();
+                    }
                 }
 
                 // -----------------------------------------------------------------
@@ -278,6 +294,11 @@ impl EvolutionEngine {
                 let proposals_this_tick = { let s = shared_mutex.lock(); s.work_budget_per_tick.max(1) };
 
                 for _ in 0..proposals_this_tick {
+                    // Check pause flag frequently (every iteration, not just outer loop)
+                    if !running_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+
                     // Snapshot live state needed to score a proposal
                     let (total_err_opt, dna_snapshot, max_tris_cap, grid_snapshot, index_snapshot) = {
                         let s = shared_mutex.lock();
@@ -363,6 +384,13 @@ impl EvolutionEngine {
                         Ok(results) => results,
                         Err(e) => {
                             eprintln!("GPU batch evaluation failed: {}, falling back to CPU", e);
+
+                            // Update stats to show we're using CPU fallback
+                            if actual_backend_name.starts_with("WGPU") {
+                                actual_backend_name = String::from("CPU (GPU error fallback)");
+                                let mut s = shared_mutex.lock();
+                                s.stats.active_backend = actual_backend_name.clone();
+                            }
                             // Evaluate using parallel CPU path as fallback
                             proposals
                                 .par_iter()

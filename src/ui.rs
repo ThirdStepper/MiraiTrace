@@ -25,6 +25,7 @@ use crate::engine::{EvolutionEngine, EvolutionStats, ComputeBackendType};
 
 /// How much HUD to show.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum HudDensity {
     Auto,    // decide from window width
     Compact, // minimal fields
@@ -572,15 +573,28 @@ impl MiraiTrace {
 
         ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
 
-        // Decide density
-        let use_compact = match self.hud_density {
-            HudDensity::Compact => true,
-            HudDensity::Full => false,
-            HudDensity::Auto => ui.available_width() < 400.0,
-        };
+        // --- Backend Indicator (Prominent) ---
+        ui.horizontal(|ui| {
+            ui.label("Backend:");
 
-        // --- Core Stats ---
-        ui.heading("Core Stats");
+            // Color-code based on backend type
+            let (text, color) = if stats.active_backend.starts_with("WGPU") {
+                (stats.active_backend.clone(), egui::Color32::from_rgb(50, 200, 50)) // Green for GPU
+            } else if stats.active_backend.contains("fallback") || stats.active_backend.contains("failed") {
+                (stats.active_backend.clone(), egui::Color32::from_rgb(255, 165, 0)) // Orange for fallback
+            } else {
+                (stats.active_backend.clone(), egui::Color32::GRAY) // Gray for CPU
+            };
+
+            ui.colored_label(color, text);
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // --- Core Evolution Stats ---
+        ui.heading("Evolution Progress");
         ui.separator();
 
         let tri = stats.triangle_count;
@@ -589,88 +603,35 @@ impl MiraiTrace {
         let best_err = stats.best_error.unwrap_or(0);
         let delta = stats.last_accept_delta.unwrap_or(0);
 
-        ui.label(format!("Triangles:    {:>6}", tri));
-        ui.label(format!("Generation:   {:>8}", gen));
+        ui.label(format!("Triangles:     {:>6}", tri));
+        ui.label(format!("Generation:    {:>8}", gen));
+        ui.add_space(4.0);
         ui.label(format!("Current error: {:>12}", curr_err));
         ui.label(format!("Best error:    {:>12}", best_err));
         ui.label(format!("Last delta:    {:>8}", delta));
 
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
-        // --- Performance ---
+        // --- Performance Metrics ---
         ui.heading("Performance");
         ui.separator();
 
         let pps = stats.proposals_per_second;
         let aps = stats.accepts_per_second;
         let accept_pct = stats.recent_acceptance_percent;
-        let accept_win = stats.recent_window_size;
 
         ui.label(format!("Proposals/sec: {:>6.1}", pps));
         ui.label(format!("Accepts/sec:   {:>6.1}", aps));
-        ui.label(format!("Acceptance:    {:>5.1}% (win {})", accept_pct, accept_win));
+        ui.label(format!("Acceptance:    {:>5.1}%", accept_pct));
 
-        ui.add_space(10.0);
-
-        // --- Operators ---
-        ui.heading("Mutation Operators");
-        ui.separator();
-
-        let op = stats.last_operator_label.as_deref().unwrap_or("-");
-        ui.label(format!("Last operator: {}", op));
-
-        let (w_add, w_remove, w_move, w_recolor) = {
-            let mut add = 0.0;
-            let mut rem = 0.0;
-            let mut mv = 0.0;
-            let mut rc = 0.0;
-            for (label, w) in &stats.operator_weights {
-                match label.as_str() {
-                    "Add" => add = *w,
-                    "Remove" => rem = *w,
-                    "Move" => mv = *w,
-                    "Recolor" => rc = *w,
-                    _ => {}
-                }
-            }
-            (add, rem, mv, rc)
-        };
-
-        if !use_compact {
-            ui.label(format!("  Add:     {:>4.2}", w_add));
-            ui.label(format!("  Remove:  {:>4.2}", w_remove));
-            ui.label(format!("  Move:    {:>4.2}", w_move));
-            ui.label(format!("  Recolor: {:>4.2}", w_recolor));
-        }
-
-        ui.add_space(10.0);
-
-        // --- Annealing ---
-        if let Some(t) = stats.anneal_temp {
-            ui.heading("Annealing");
-            ui.separator();
-            ui.label(format!("Temperature: {:.3}", t));
-            ui.add_space(10.0);
-        }
-
-        // --- Uphill Acceptance ---
-        ui.heading("Uphill Acceptance");
-        ui.separator();
-        ui.label(format!(
-            "Rate: {:.1}% ({} / {})",
-            stats.recent_uphill_acceptance_percent,
-            stats.total_uphill_accepts,
-            stats.total_uphill_attempts
-        ));
-
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
         // --- Error History Plot ---
-        if self.show_mini_plot && !stats.error_history.is_empty() {
+        if !stats.error_history.is_empty() {
             ui.heading("Error History");
             ui.separator();
 
-            let plot_height = 120.0;
+            let plot_height = 140.0;
             let plot_response = ui.allocate_response(
                 egui::vec2(ui.available_width(), plot_height),
                 egui::Sense::hover(),
@@ -695,25 +656,9 @@ impl MiraiTrace {
 
                 painter.line_segment(
                     [egui::pos2(x0, y0), egui::pos2(x1, y1)],
-                    egui::Stroke::new(2.0, ui.visuals().text_color()),
+                    egui::Stroke::new(2.5, ui.visuals().text_color()),
                 );
             }
         }
-
-        // --- HUD Controls ---
-        ui.add_space(10.0);
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("HUD Density:");
-            let mut density = self.hud_density;
-            ui.radio_value(&mut density, HudDensity::Compact, "Compact");
-            ui.radio_value(&mut density, HudDensity::Full, "Full");
-            ui.radio_value(&mut density, HudDensity::Auto, "Auto");
-            if density != self.hud_density {
-                self.hud_density = density;
-            }
-        });
-
-        ui.checkbox(&mut self.show_mini_plot, "Show error plot");
     }
 }
