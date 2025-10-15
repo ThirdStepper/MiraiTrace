@@ -61,26 +61,6 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Check if backend is available
     fn is_available() -> bool where Self: Sized;
-
-    /// Batch evaluation of multiple proposals - evaluates all proposals in parallel
-    /// Returns SSE (sum of squared errors) for each proposal's region
-    fn evaluate_proposals_batch(
-        &mut self,
-        canvas_rgba: &[u8],
-        target_rgba: &[u8],
-        canvas_w: usize,
-        canvas_h: usize,
-        background_color: [u8; 4],
-        proposals: &[ProposalEvaluationData],
-    ) -> Result<Vec<u64>, String>;
-}
-
-/// Data for a single proposal to be evaluated
-#[derive(Clone, Debug)]
-pub struct ProposalEvaluationData {
-    pub region: IntRect,
-    pub triangles: Vec<Triangle>,
-    pub triangle_indices: Vec<usize>,
 }
 
 /// CPU backend - uses the existing CPU rasterization code
@@ -185,48 +165,6 @@ impl ComputeBackend for CpuBackend {
 
     fn is_available() -> bool {
         true
-    }
-
-    fn evaluate_proposals_batch(
-        &mut self,
-        _canvas_rgba: &[u8],
-        target_rgba: &[u8],
-        canvas_w: usize,
-        canvas_h: usize,
-        background_color: [u8; 4],
-        proposals: &[ProposalEvaluationData],
-    ) -> Result<Vec<u64>, String> {
-        use super::raster::{fill_region_rgba_solid, rasterize_triangle_over_unpremul_rgba_clipped_region, total_squared_error_rgb_region_from_buffer_vs_target};
-
-        let mut results = Vec::with_capacity(proposals.len());
-
-        for proposal in proposals {
-            // Compose the region
-            let mut buffer = vec![0u8; proposal.region.w * proposal.region.h * 4];
-            fill_region_rgba_solid(&mut buffer, &proposal.region, background_color);
-
-            // Draw triangles
-            for &idx in &proposal.triangle_indices {
-                if idx < proposal.triangles.len() {
-                    rasterize_triangle_over_unpremul_rgba_clipped_region(
-                        &mut buffer,
-                        &proposal.region,
-                        canvas_w,
-                        canvas_h,
-                        &proposal.triangles[idx],
-                    );
-                }
-            }
-
-            // Calculate SSE
-            let sse = total_squared_error_rgb_region_from_buffer_vs_target(
-                &buffer, target_rgba, canvas_w, &proposal.region
-            );
-
-            results.push(sse);
-        }
-
-        Ok(results)
     }
 }
 
@@ -928,39 +866,309 @@ impl ComputeBackend for WgpuBackend {
             return Ok(Vec::new());
         }
 
-        // For GPU batch evaluation, we have two strategies:
-        // 1. Simple: Sequential evaluation (what we do now)
-        // 2. Advanced: True parallel batch with custom shader (future optimization)
+        // ASYNCHRONOUS BATCH SUBMISSION:
+        // Instead of calling compose_region + calculate_sse_region for each proposal
+        // (which blocks 2x per proposal), we:
+        // 1. Create all GPU work upfront without blocking
+        // 2. Submit all work in a single queue.submit() call
+        // 3. Block once with device.poll()
+        // 4. Read all results
+        //
+        // This eliminates 2N blocking calls down to 1 (for N proposals)
 
-        // Currently using strategy 1 (still benefits from persistent buffers)
-        // Strategy 2 would require:
-        // - Packing all proposal data into unified buffers
-        // - Dispatching one workgroup per proposal
-        // - Each workgroup rasterizes + calculates SSE independently
-        // - Results written to output array
+        // Upload target buffer once (borrows self mutably, then releases)
+        self.upload_target_if_needed(target_rgba)?;
 
-        let mut results = Vec::with_capacity(proposals.len());
+        let device = self.device.as_ref().ok_or("Device not initialized")?;
+        let queue = self.queue.as_ref().ok_or("Queue not initialized")?;
+        let fill_pipeline = self.fill_pipeline.as_ref().ok_or("Fill pipeline not initialized")?;
+        let rasterize_pipeline = self.rasterize_pipeline.as_ref().ok_or("Rasterize pipeline not initialized")?;
+        let sse_pipeline = self.sse_pipeline.as_ref().ok_or("SSE pipeline not initialized")?;
+        let fill_bgl = self.fill_bind_group_layout.as_ref().ok_or("Fill bind group layout not initialized")?;
+        let rasterize_bgl = self.rasterize_bind_group_layout.as_ref().ok_or("Rasterize bind group layout not initialized")?;
+        let sse_bgl = self.sse_bind_group_layout.as_ref().ok_or("SSE bind group layout not initialized")?;
+        let target_buffer = self.target_buffer_gpu.as_ref().ok_or("Target buffer not created")?;
 
+        // Storage for staging buffers (we need to read SSE results at the end)
+        let mut sse_staging_buffers = Vec::with_capacity(proposals.len());
+        let mut command_buffers = Vec::with_capacity(proposals.len());
+
+        // PHASE 1: Create all GPU work (no blocking)
         for proposal in proposals {
-            // Compose the candidate region
-            let region_buffer = self.compose_region(
-                &proposal.region,
-                canvas_w,
-                canvas_h,
-                background_color,
-                &proposal.triangles,
-                &proposal.triangle_indices,
-            )?;
+            let region = &proposal.region;
+            if region.w == 0 || region.h == 0 {
+                // Empty region - push dummy buffer
+                sse_staging_buffers.push(None);
+                continue;
+            }
 
-            // Calculate SSE
-            let sse = self.calculate_sse_region(
-                &region_buffer,
-                target_rgba,
-                canvas_w,
-                &proposal.region,
-            )?;
+            let pixel_count = region.w * region.h;
+            let buffer_size = pixel_count * 4;
 
-            results.push(sse);
+            // Create temporary output buffer for this proposal's rasterized region
+            let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Proposal Output Buffer"),
+                size: buffer_size as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Proposal Encoder"),
+            });
+
+            // Step 1: Fill with background color
+            {
+                let params_data: [u32; 8] = [
+                    region.w as u32,
+                    region.h as u32,
+                    background_color[0] as u32,
+                    background_color[1] as u32,
+                    background_color[2] as u32,
+                    background_color[3] as u32,
+                    0, 0,
+                ];
+
+                let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Fill Params"),
+                    contents: bytemuck::cast_slice(&params_data),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Fill Bind Group"),
+                    layout: fill_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: output_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Fill Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(fill_pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+
+                let workgroup_x = (region.w as u32 + 15) / 16;
+                let workgroup_y = (region.h as u32 + 15) / 16;
+                compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+            }
+
+            // Step 2: Rasterize triangles
+            if !proposal.triangle_indices.is_empty() {
+                #[repr(C)]
+                #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+                struct GpuTriangle {
+                    x0: i32, y0: i32,
+                    x1: i32, y1: i32,
+                    x2: i32, y2: i32,
+                    r: u32, g: u32, b: u32, a: u32,
+                    _pad: [u32; 2],
+                }
+
+                let gpu_triangles: Vec<GpuTriangle> = proposal.triangles.iter().map(|t| GpuTriangle {
+                    x0: t.x0, y0: t.y0,
+                    x1: t.x1, y1: t.y1,
+                    x2: t.x2, y2: t.y2,
+                    r: t.r as u32,
+                    g: t.g as u32,
+                    b: t.b as u32,
+                    a: t.a as u32,
+                    _pad: [0, 0],
+                }).collect();
+
+                let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Triangle Buffer"),
+                    contents: bytemuck::cast_slice(&gpu_triangles),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+                let indices_u32: Vec<u32> = proposal.triangle_indices.iter().map(|&i| i as u32).collect();
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Index Buffer"),
+                    contents: bytemuck::cast_slice(&indices_u32),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+                let params_data: [u32; 8] = [
+                    region.x as u32,
+                    region.y as u32,
+                    region.w as u32,
+                    region.h as u32,
+                    canvas_w as u32,
+                    canvas_h as u32,
+                    proposal.triangle_indices.len() as u32,
+                    0,
+                ];
+
+                let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Rasterize Params"),
+                    contents: bytemuck::cast_slice(&params_data),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Rasterize Bind Group"),
+                    layout: rasterize_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: triangle_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: index_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: output_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Rasterize Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(rasterize_pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+
+                let workgroup_x = (region.w as u32 + 15) / 16;
+                let workgroup_y = (region.h as u32 + 15) / 16;
+                compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+            }
+
+            // Step 3: Calculate SSE (still part of this encoder)
+            // Pack output buffer for SSE comparison
+            let region_packed_size = pixel_count * 4; // u32 per pixel
+
+            // Create temporary region buffer by copying from output_buffer
+            // (SSE shader expects packed u32 format)
+            let region_buffer_for_sse = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Region Buffer for SSE"),
+                size: region_packed_size as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            encoder.copy_buffer_to_buffer(&output_buffer, 0, &region_buffer_for_sse, 0, buffer_size as u64);
+
+            // SSE output buffer
+            let sse_output_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("SSE Output"),
+                contents: bytemuck::cast_slice(&[0u32]),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+
+            let params_data: [u32; 8] = [
+                region.x as u32,
+                region.y as u32,
+                region.w as u32,
+                region.h as u32,
+                canvas_w as u32,
+                0, 0, 0,
+            ];
+
+            let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("SSE Params"),
+                contents: bytemuck::cast_slice(&params_data),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("SSE Bind Group"),
+                layout: sse_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: region_buffer_for_sse.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: target_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: sse_output_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("SSE Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(sse_pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+
+                let workgroup_x = (region.w as u32 + 15) / 16;
+                let workgroup_y = (region.h as u32 + 15) / 16;
+                compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+            }
+
+            // Copy SSE result to staging buffer for readback
+            let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("SSE Staging"),
+                size: 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            encoder.copy_buffer_to_buffer(&sse_output_buffer, 0, &staging_buffer, 0, 4);
+
+            // Store encoder as command buffer (but don't submit yet!)
+            command_buffers.push(encoder.finish());
+            sse_staging_buffers.push(Some(staging_buffer));
+        }
+
+        // PHASE 2: Single submit for ALL proposals
+        queue.submit(command_buffers);
+
+        // PHASE 3: Single blocking wait
+        device.poll(wgpu::Maintain::Wait);
+
+        // PHASE 4: Read all SSE results
+        let mut results = Vec::with_capacity(proposals.len());
+        for staging_buffer_opt in sse_staging_buffers {
+            if let Some(staging_buffer) = staging_buffer_opt {
+                let buffer_slice = staging_buffer.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+
+                // Note: buffer should already be ready due to device.poll() above
+                // but we still need to wait for the map_async callback
+                device.poll(wgpu::Maintain::Wait);
+                rx.recv().unwrap().map_err(|e| format!("Buffer map failed: {:?}", e))?;
+
+                let data = buffer_slice.get_mapped_range();
+                let sse_u32 = bytemuck::cast_slice::<u8, u32>(&data)[0];
+                drop(data);
+                staging_buffer.unmap();
+
+                results.push(sse_u32 as u64);
+            } else {
+                // Empty region
+                results.push(0);
+            }
         }
 
         Ok(results)
@@ -972,44 +1180,5 @@ impl ComputeBackend for WgpuBackend {
 
     fn is_available() -> bool {
         WgpuBackend::check_available()
-    }
-
-    fn evaluate_proposals_batch(
-        &mut self,
-        _canvas_rgba: &[u8],
-        target_rgba: &[u8],
-        canvas_w: usize,
-        canvas_h: usize,
-        background_color: [u8; 4],
-        proposals: &[ProposalEvaluationData],
-    ) -> Result<Vec<u64>, String> {
-        // For simplicity, use sequential CPU evaluation for each proposal
-        // Full GPU batch evaluation would require a new shader that processes multiple regions
-        // This still uses GPU acceleration for each individual proposal
-        let mut results = Vec::with_capacity(proposals.len());
-
-        for proposal in proposals {
-            // Use GPU to compose the region
-            let buffer = self.compose_region(
-                &proposal.region,
-                canvas_w,
-                canvas_h,
-                background_color,
-                &proposal.triangles,
-                &proposal.triangle_indices,
-            )?;
-
-            // Use GPU to calculate SSE
-            let sse = self.calculate_sse_region(
-                &buffer,
-                target_rgba,
-                canvas_w,
-                &proposal.region,
-            )?;
-
-            results.push(sse);
-        }
-
-        Ok(results)
     }
 }
