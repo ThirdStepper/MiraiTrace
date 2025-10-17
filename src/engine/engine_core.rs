@@ -30,11 +30,11 @@ use super::{
     total_squared_error_rgb_region_from_canvas_vs_target,
     total_sse_region_with_cutoff, pad_and_clamp_rect,
     AdaptiveMutationScheduler, MutationOperator,
-    FrameDimensions, IntRect,
+    FrameDimensions, IntRect, Triangle,
     TileGrid, TriangleSpatialIndex, choose_tile_size,
     TriangleDna, SimAnneal,
 };
-use super::mutation::propose_mutation_with_bbox;
+use super::mutation::{propose_mutation_with_bbox, generate_micro_variations};
 use super::EvolutionStats;
 use super::compute_backend::{ComputeBackend, CpuBackend, WgpuBackend, ProposalEvaluationData};
 
@@ -324,11 +324,20 @@ impl EvolutionEngine {
                     let op = scheduler.sample_operator(&mut rng, dna_snapshot.triangles.len(), growth_target);
 
                     // BATCH MUTATION SAMPLING: Try N candidates, keep the best
-                    // This is the key improvement - we always make progress!
-                    let batch_size = if dna_snapshot.triangles.len() < growth_target {
-                        20  // Larger batches during growth phase
+                    // Scale batch size by resolution to avoid excessive GPU/CPU work
+                    let pixels = canvas_w * canvas_h;
+                    let base_batch_size = if pixels > 800 * 800 {
+                        5  // High res: smaller batches
+                    } else if pixels > 400 * 400 {
+                        10  // Medium res
                     } else {
-                        10  // Smaller batches during refinement
+                        15  // Low res: larger batches
+                    };
+
+                    let batch_size = if dna_snapshot.triangles.len() < growth_target {
+                        base_batch_size + 5  // Slightly larger during growth
+                    } else {
+                        base_batch_size  // Base size during refinement
                     };
 
                     // BATCH SAMPLING: Generate all proposals first (sequential with shared RNG)
@@ -348,19 +357,46 @@ impl EvolutionEngine {
                         s.pixel_backbuffer_rgba.clone()
                     };
 
-                    // GPU BATCH EVALUATION: Convert proposals to GPU format and evaluate in a single batch
+                    // GPU BATCH EVALUATION: Convert proposals to GPU format with spatial culling
+                    // This matches the CPU path logic for correct triangle rendering
                     let gpu_proposals: Vec<ProposalEvaluationData> = proposals
                         .iter()
-                        .filter_map(|p| {
+                        .map(|p| {
                             let union_rect = pad_and_clamp_rect(p.affected_bbox_px, 2, canvas_w, canvas_h);
                             if union_rect.w == 0 || union_rect.h == 0 { return None; }
 
+                            // Clone spatial index for mutation (needed by triangles_overlapping_region)
+                            let mut index_local = index_snapshot.clone();
+
+                            // Use spatial index to find triangles overlapping this region (same as CPU path)
+                            let mut overlapping_indices = index_local.triangles_overlapping_region(
+                                &union_rect, canvas_w, canvas_h, dna_snapshot.triangles.len()
+                            );
+
+                            // Ensure the changed triangle is included (it might have moved into region)
+                            if let Some(ci) = p.changed_index {
+                                if !overlapping_indices.iter().any(|&v| v == ci) {
+                                    overlapping_indices.push(ci);
+                                    overlapping_indices.sort_unstable();
+                                }
+                            }
+
+                            // Build triangle list: candidate for changed index, current DNA for others
+                            let triangles_for_gpu: Vec<Triangle> = overlapping_indices.iter().map(|&idx| {
+                                if Some(idx) == p.changed_index {
+                                    p.candidate_dna_out.triangles[idx].clone()
+                                } else {
+                                    dna_snapshot.triangles[idx].clone()
+                                }
+                            }).collect();
+
                             Some(ProposalEvaluationData {
                                 region: union_rect,
-                                triangles: p.candidate_dna_out.triangles.clone(),
-                                triangle_indices: (0..p.candidate_dna_out.triangles.len()).collect(),
+                                triangles: triangles_for_gpu,
+                                triangle_indices: (0..overlapping_indices.len()).collect(),
                             })
                         })
+                        .filter_map(|x| x)
                         .collect();
 
                     // Early exit if no valid proposals
@@ -425,28 +461,111 @@ impl EvolutionEngine {
                         }
                     };
 
-                    // Find the best candidate based on region SSE
-                    let best_idx = region_sse_results.iter()
+                    // Sort proposals by SSE (best to worst)
+                    // Try up to top 3 proposals to balance exploration vs overhead
+                    let mut sorted_proposals: Vec<(usize, u64)> = region_sse_results
+                        .iter()
                         .enumerate()
-                        .min_by_key(|(_, &sse)| sse)
-                        .map(|(idx, _)| idx);
+                        .map(|(i, &sse)| (i, sse))
+                        .collect();
 
-                    let best_idx = match best_idx {
-                        Some(idx) => idx,
+                    if sorted_proposals.is_empty() {
+                        sa.note_no_improvement();
+                        continue;
+                    }
+
+                    sorted_proposals.sort_by_key(|(_, sse)| *sse);
+
+                    // Try proposals from best to worst until one is accepted (limit to top 3)
+                    let mut accepted_proposal: Option<usize> = None;
+                    let max_tries = 3.min(sorted_proposals.len());
+
+                    for &(proposal_idx, _) in sorted_proposals.iter().take(max_tries) {
+                        let proposal = &proposals[proposal_idx];
+                        let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
+                        let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
+                        let _tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
+
+                        // Re-render the candidate to get the scratch_region buffer
+                        // (GPU evaluation doesn't return the actual pixels, only SSE)
+                        scratch_region.resize(union_rect.w * union_rect.h * 4, 0);
+                        fill_region_rgba_solid(&mut scratch_region, &union_rect, bg_rgba);
+                        let mut index_snapshot_local = index_snapshot.clone();
+                        compose_candidate_region_with_culled_subset(
+                            &mut scratch_region, &union_rect, canvas_w, canvas_h,
+                            &dna_snapshot, &mut index_snapshot_local,
+                            proposal.changed_index, &proposal.candidate_dna_out,
+                        );
+
+                        // Final exact recompute (no cutoff) before acceptance decision
+                        let exact_current_in_rect = {
+                            let s = shared_mutex.lock();
+                            total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
+                        };
+
+                        let exact_candidate_in_rect = total_squared_error_rgb_region_from_buffer_vs_target(
+                            &scratch_region, &target_rgba, canvas_w, &union_rect);
+
+                        let candidate_total_error = match current_total_error.checked_sub(exact_current_in_rect) {
+                            Some(rest) => rest + exact_candidate_in_rect,
+                            None => {
+                                let base = grid_snapshot.sse_per_tile.iter().copied().sum::<u64>().max(current_total_error);
+                                base.saturating_sub(exact_current_in_rect) + exact_candidate_in_rect
+                            }
+                        };
+
+                        // SA acceptance (normalized by region area)
+                        let delta = candidate_total_error as i64 - current_total_error as i64;
+                        let region_area = (union_rect.w * union_rect.h) as usize;
+
+                        // Phase-aware tightening while below the growth target
+                        let tri_count = dna_snapshot.triangles.len();
+                        let pre_cap = tri_count < growth_target;
+                        sa.set_phase(pre_cap);
+
+                        let accepted = sa.should_accept_area(&mut rng, delta, region_area, exact_current_in_rect);
+                        let is_uphill = delta > 0;
+
+                        // Update HUD counters for this attempt
+                        {
+                            let mut s = shared_mutex.lock();
+                            s.proposals_counter_window = s.proposals_counter_window.saturating_add(1);
+                            s.stats.total_proposals = s.stats.total_proposals.saturating_add(1);
+
+                            if is_uphill {
+                                s.uphill_attempts_counter_window = s.uphill_attempts_counter_window.saturating_add(1);
+                                s.stats.total_uphill_attempts = s.stats.total_uphill_attempts.saturating_add(1);
+                                if accepted {
+                                    s.uphill_accepts_counter_window = s.uphill_accepts_counter_window.saturating_add(1);
+                                    s.stats.total_uphill_accepts = s.stats.total_uphill_accepts.saturating_add(1);
+                                }
+                            }
+                        }
+
+                        if accepted {
+                            // Store the accepted proposal index and break out
+                            accepted_proposal = Some(proposal_idx);
+                            break;
+                        }
+                        // If not accepted, try next proposal in sorted order
+                    }
+
+                    // After trying all proposals, check if any was accepted
+                    let (_proposal_idx, proposal) = match accepted_proposal {
+                        Some(idx) => (idx, &proposals[idx]),
                         None => {
+                            // None of the proposals were accepted
                             sa.note_no_improvement();
                             continue;
                         }
                     };
 
-                    // Extract the winning proposal
-                    let proposal = &proposals[best_idx];
+                    // Re-extract the winning proposal data (we need this for commit)
                     let union_rect = pad_and_clamp_rect(proposal.affected_bbox_px, 2, canvas_w, canvas_h);
                     let sse_rect = pad_and_clamp_rect(union_rect, 2, canvas_w, canvas_h);
                     let tiles_touched = grid_snapshot.tiles_overlapping_rect(&sse_rect, canvas_w, canvas_h);
 
-                    // Re-render the best candidate to get the scratch_region buffer
-                    // (GPU evaluation doesn't return the actual pixels, only SSE)
+                    // Re-render accepted proposal for commit
                     scratch_region.resize(union_rect.w * union_rect.h * 4, 0);
                     fill_region_rgba_solid(&mut scratch_region, &union_rect, bg_rgba);
                     let mut index_snapshot_local = index_snapshot.clone();
@@ -456,7 +575,7 @@ impl EvolutionEngine {
                         proposal.changed_index, &proposal.candidate_dna_out,
                     );
 
-                    // Final exact recompute (no cutoff) before acceptance decision
+                    // Final recompute for the accepted proposal
                     let exact_current_in_rect = {
                         let s = shared_mutex.lock();
                         total_squared_error_rgb_region_from_canvas_vs_target(&s.pixel_backbuffer_rgba, &target_rgba, canvas_w, &union_rect)
@@ -473,46 +592,17 @@ impl EvolutionEngine {
                         }
                     };
 
-                    // SA acceptance (normalized by region area)
-                    
                     let delta = candidate_total_error as i64 - current_total_error as i64;
-                    let region_area = (union_rect.w * union_rect.h) as usize;
+                    let _is_uphill = delta > 0;
 
-                    // Phase-aware tightening while below the growth target
-                    let tri_count = dna_snapshot.triangles.len();
-                    let pre_cap = tri_count < growth_target;
-                    sa.set_phase(pre_cap);
-
-                    //let accepted = sa.should_accept(&mut rng, delta, region_area as f64);
-                    let accepted = sa.should_accept_area(&mut rng, delta, region_area, exact_current_in_rect);
-
-
-                    
-
-                    let is_uphill = delta > 0;
-
-                    // Update scheduler bias
-                    scheduler.record_outcome(op, accepted);
+                    // Update scheduler bias (accepted is always true here since we found one)
+                    scheduler.record_outcome(op, true);
                     let op_weights = scheduler.current_weights();
 
-                    // Update HUD counters (not touching errors yet)
+                    // Update HUD counters and stats
                     {
                         let mut s = shared_mutex.lock();
-                    
-                        // Existing global counters
-                        s.proposals_counter_window = s.proposals_counter_window.saturating_add(1);
-                        s.stats.total_proposals = s.stats.total_proposals.saturating_add(1);
-                    
-                        // NEW: uphill-only counters (window + lifetime)
-                        if is_uphill {
-                            s.uphill_attempts_counter_window = s.uphill_attempts_counter_window.saturating_add(1);
-                            s.stats.total_uphill_attempts = s.stats.total_uphill_attempts.saturating_add(1);
-                            if accepted {
-                                s.uphill_accepts_counter_window = s.uphill_accepts_counter_window.saturating_add(1);
-                                s.stats.total_uphill_accepts = s.stats.total_uphill_accepts.saturating_add(1);
-                            }
-                        }
-                    
+
                         // Existing half-second window flush
                         let elapsed = s.window_started_at.elapsed().as_secs_f32();
                         if elapsed >= 0.5 {
@@ -522,22 +612,22 @@ impl EvolutionEngine {
                             s.stats.recent_acceptance_percent = if s.proposals_counter_window > 0 {
                                 (s.accepts_counter_window as f32 / s.proposals_counter_window as f32) * 100.0
                             } else { 0.0 };
-                        
+
                             // NEW: flush uphill-only window metrics into stats
                             s.stats.recent_uphill_window_size = (s.uphill_attempts_counter_window as usize).max(0);
                             s.stats.recent_uphill_acceptance_percent = if s.uphill_attempts_counter_window > 0 {
                                 (s.uphill_accepts_counter_window as f32 / s.uphill_attempts_counter_window as f32) * 100.0
                             } else { 0.0 };
-                        
+
                             // reset both sets of window counters
                             s.proposals_counter_window = 0;
                             s.accepts_counter_window = 0;
                             s.uphill_attempts_counter_window = 0;
                             s.uphill_accepts_counter_window = 0;
-                        
+
                             s.window_started_at = Instant::now();
                         }
-                    
+
                         // existing labels/weights
                         s.stats.last_operator_label = Some(op.label().to_string());
                         s.stats.last_tiles_touched = Some(tiles_touched.len());
@@ -548,18 +638,9 @@ impl EvolutionEngine {
                             ("Recolor".into(), op_weights[3]),
                         ];
                         s.stats.max_triangles_cap = s.max_triangles_cap;
-                    
+
                         // keep exporting annealer temp (so HUD can show it)
-                        s.stats.anneal_temp = Some(sa.temp()); // or f64 if that’s your field type
-                    }
-
-                    // Removed aggressive phase-based cooling - let the annealer manage its own temperature
-                    // The annealer's adaptive mechanism and set_phase() provide sufficient control
-
-                    // Rejected → count no-improvement, move on.
-                    if !accepted {
-                        sa.note_no_improvement();
-                        continue;
+                        s.stats.anneal_temp = Some(sa.temp());
                     }
 
                     // Accepted → commit, then evaluate true improvement from tiles_sum and update SA.
@@ -651,6 +732,129 @@ impl EvolutionEngine {
                         s.accepts_counter_window = s.accepts_counter_window.saturating_add(1);
                         s.stats.total_accepts = s.stats.total_accepts.saturating_add(1);
                     }
+
+                    // ========== MICRO-OPTIMIZATION (Evolve-style local refinement) ==========
+                    // After accepting a mutation, try small variations to "snap" to a better local optimum
+                    // This mimics tux3/Evolve's aggressive post-acceptance optimization
+                    if let Some(changed_idx) = proposal.changed_index {
+                        // Get current DNA snapshot
+                        let micro_dna = { shared_mutex.lock().dna.clone() };
+
+                        // Generate 8 micro-variations (color, alpha, vertex tweaks)
+                        let micro_proposals = generate_micro_variations(
+                            &micro_dna,
+                            changed_idx,
+                            canvas_w as i32,
+                            canvas_h as i32,
+                            &mut rng,
+                            8,
+                        );
+
+                        if !micro_proposals.is_empty() {
+                            // Convert to GPU format with spatial culling (same as main batch)
+                            let micro_gpu_proposals: Vec<ProposalEvaluationData> = micro_proposals
+                                .iter()
+                                .map(|p| {
+                                    let union_rect = pad_and_clamp_rect(p.affected_bbox_px, 2, canvas_w, canvas_h);
+                                    if union_rect.w == 0 || union_rect.h == 0 { return None; }
+
+                                    let mut index_local = index_snapshot.clone();
+                                    let mut overlapping_indices = index_local.triangles_overlapping_region(
+                                        &union_rect, canvas_w, canvas_h, micro_dna.triangles.len()
+                                    );
+
+                                    if let Some(ci) = p.changed_index {
+                                        if !overlapping_indices.iter().any(|&v| v == ci) {
+                                            overlapping_indices.push(ci);
+                                            overlapping_indices.sort_unstable();
+                                        }
+                                    }
+
+                                    let triangles_for_gpu: Vec<Triangle> = overlapping_indices.iter().map(|&idx| {
+                                        if Some(idx) == p.changed_index {
+                                            p.candidate_dna_out.triangles[idx].clone()
+                                        } else {
+                                            micro_dna.triangles[idx].clone()
+                                        }
+                                    }).collect();
+
+                                    Some(ProposalEvaluationData {
+                                        region: union_rect,
+                                        triangles: triangles_for_gpu,
+                                        triangle_indices: (0..overlapping_indices.len()).collect(),
+                                    })
+                                })
+                                .filter_map(|x| x)
+                                .collect();
+
+                            // Evaluate all micro-variations in parallel (GPU or CPU)
+                            if let Ok(micro_sse_results) = backend.evaluate_proposals_batch(
+                                &canvas_snapshot, &target_rgba, canvas_w, canvas_h, bg_rgba, &micro_gpu_proposals
+                            ) {
+                                // Find best micro-variation (pure hill climbing for micro-opts)
+                                if let Some((best_idx, &best_sse)) = micro_sse_results.iter().enumerate().min_by_key(|(_, &sse)| sse) {
+                                    let current_sse = {
+                                        let s = shared_mutex.lock();
+                                        s.current_total_squared_error.unwrap_or(u64::MAX)
+                                    };
+
+                                    // Only accept if micro-variation improves (greedy for micro-opts)
+                                    if best_sse < current_sse {
+                                        let best_micro = &micro_proposals[best_idx];
+                                        let micro_rect = pad_and_clamp_rect(best_micro.affected_bbox_px, 2, canvas_w, canvas_h);
+
+                                        // Re-render best micro-variation for commit
+                                        scratch_region.resize(micro_rect.w * micro_rect.h * 4, 0);
+                                        fill_region_rgba_solid(&mut scratch_region, &micro_rect, bg_rgba);
+                                        let mut index_local = index_snapshot.clone();
+                                        compose_candidate_region_with_culled_subset(
+                                            &mut scratch_region, &micro_rect, canvas_w, canvas_h,
+                                            &micro_dna, &mut index_local,
+                                            best_micro.changed_index, &best_micro.candidate_dna_out,
+                                        );
+
+                                        // Commit best micro-variation (simplified - no SA, direct commit)
+                                        let mut s = shared_mutex.lock();
+                                        let ts = choose_tile_size(s.width, s.height);
+                                        let mut tg = s.tile_grid.take().unwrap_or_else(|| TileGrid::new(s.width, s.height, ts));
+
+                                        tg.blit_region_and_update_sse(
+                                            &mut s.pixel_backbuffer_rgba,
+                                            &target_rgba,
+                                            canvas_w,
+                                            &micro_rect,
+                                            &scratch_region,
+                                        );
+
+                                        let tiles_sum: u64 = tg.sse_per_tile.iter().copied().sum();
+                                        s.current_total_squared_error = Some(tiles_sum);
+                                        s.tile_grid = Some(tg);
+                                        s.dna = best_micro.candidate_dna_out.clone();
+
+                                        if s.best_total_squared_error.map(|b| tiles_sum < b).unwrap_or(true) {
+                                            s.best_total_squared_error = Some(tiles_sum);
+                                            s.stats.best_error = Some(tiles_sum);
+                                            s.stats.push_best_error_history(tiles_sum);
+                                        }
+
+                                        // Update spatial index for micro-variation (simplified - just update the changed triangle)
+                                        let (w2, h2) = (s.width, s.height);
+                                        let mut si = s.spatial_index.take().unwrap_or_else(|| TriangleSpatialIndex::new(w2, h2, ts));
+                                        if let Some(idx) = best_micro.changed_index {
+                                            if let Some(ref old_tri) = best_micro.old_triangle_for_update {
+                                                si.remove_triangle(idx, old_tri, w2, h2);
+                                            }
+                                            let tri_now = &s.dna.triangles[idx];
+                                            si.insert_triangle(idx, tri_now, w2, h2);
+                                        }
+                                        s.spatial_index = Some(si);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // ========== END MICRO-OPTIMIZATION ==========
+
                 } // end proposals loop
             } // end worker loop
         });
@@ -713,6 +917,16 @@ impl EvolutionEngine {
             s.pixel_backbuffer_rgba = vec![0; s.width * s.height * 4];
             s.tile_grid = Some(TileGrid::new(s.width, s.height, ts));
             s.spatial_index = Some(TriangleSpatialIndex::new(s.width, s.height, ts));
+
+            // Scale work budget by resolution to avoid excessive work at high resolutions
+            let pixels = s.width * s.height;
+            s.work_budget_per_tick = if pixels > 800 * 800 {
+                250  // High res: 250 iterations per tick (still 5K-10K proposals evaluated)
+            } else if pixels > 400 * 400 {
+                500  // Medium res
+            } else {
+                1000  // Low res (reduced from 5000 - was excessive)
+            };
         }
         s.target_image_rgba = Some(rgba);
 

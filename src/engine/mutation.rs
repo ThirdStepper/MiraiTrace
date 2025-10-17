@@ -226,6 +226,91 @@ fn triangle_centered_in_tile(
     }
 }
 
+// ---------- Micro-optimization (Evolve-style refinement) ----------
+
+/// Generate small variations of an accepted mutation for local refinement.
+/// This mimics tux3/Evolve's aggressive post-acceptance optimization.
+/// Returns a batch of micro-proposals that make small tweaks to the accepted triangle.
+pub(super) fn generate_micro_variations(
+    current_dna: &TriangleDna,
+    changed_index: usize,
+    canvas_w: i32,
+    canvas_h: i32,
+    rng: &mut PcgRng,
+    num_variations: usize,
+) -> Vec<Proposal> {
+    if changed_index >= current_dna.triangles.len() {
+        return Vec::new();
+    }
+
+    let mut variations = Vec::with_capacity(num_variations);
+    let original_tri = &current_dna.triangles[changed_index];
+
+    // Generate micro-variations:
+    // 1. Color variations (±5 in RGB)
+    // 2. Alpha variations (±10)
+    // 3. Vertex micro-movements (±2-3 pixels)
+
+    for i in 0..num_variations {
+        let mut dna_variant = current_dna.clone();
+        let tri = &mut dna_variant.triangles[changed_index];
+
+        match i % 3 {
+            0 => {
+                // Color variation: adjust one random channel
+                let channel = rng.gen_range(0..3);
+                let delta = rng.gen_range(-5..=5);
+                match channel {
+                    0 => tri.r = (tri.r as i32 + delta).clamp(0, 255) as u8,
+                    1 => tri.g = (tri.g as i32 + delta).clamp(0, 255) as u8,
+                    _ => tri.b = (tri.b as i32 + delta).clamp(0, 255) as u8,
+                }
+            }
+            1 => {
+                // Alpha variation
+                let delta = rng.gen_range(-10..=10);
+                tri.a = (tri.a as i32 + delta).clamp(30, 220) as u8;
+            }
+            _ => {
+                // Vertex micro-movement: move one random vertex slightly
+                let vertex = rng.gen_range(0..3);
+                let dx = rng.gen_range(-2..=2);
+                let dy = rng.gen_range(-2..=2);
+
+                match vertex {
+                    0 => {
+                        tri.x0 = clamp_i32(tri.x0 + dx, 0, canvas_w - 1);
+                        tri.y0 = clamp_i32(tri.y0 + dy, 0, canvas_h - 1);
+                    }
+                    1 => {
+                        tri.x1 = clamp_i32(tri.x1 + dx, 0, canvas_w - 1);
+                        tri.y1 = clamp_i32(tri.y1 + dy, 0, canvas_h - 1);
+                    }
+                    _ => {
+                        tri.x2 = clamp_i32(tri.x2 + dx, 0, canvas_w - 1);
+                        tri.y2 = clamp_i32(tri.y2 + dy, 0, canvas_h - 1);
+                    }
+                }
+            }
+        }
+
+        // Conservative affected bbox = union(old, new)
+        let bbox_old = triangle_bbox_px(original_tri, canvas_w as usize, canvas_h as usize);
+        let bbox_new = triangle_bbox_px(tri, canvas_w as usize, canvas_h as usize);
+        let affected = union_rect(&bbox_old, &bbox_new);
+
+        variations.push(Proposal {
+            candidate_dna_out: dna_variant,
+            affected_bbox_px: affected,
+            changed_index: Some(changed_index),
+            old_triangle_for_update: Some(original_tri.clone()),
+            op: MutationOperator::Recolor, // Micro-optimizations are refinements
+        });
+    }
+
+    variations
+}
+
 // ---------- Main entry called by engine_core ----------
 
 pub(super) fn propose_mutation_with_bbox(
